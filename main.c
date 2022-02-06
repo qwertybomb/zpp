@@ -37,6 +37,7 @@ static void ZPP_format_error(ZPP_Error const *error,
         [ZPP_ERROR_UNTERMINATED_CHR] = "unterminated char literal",
         [ZPP_ERROR_UNEXPECTED_EOL]   = "unexpected eol found",
         [ZPP_ERROR_UNEXPECTED_TOK]   = "unexpected token found",
+        [ZPP_ERROR_INVALID_MACRO] = "invalid macro found",
     };
     
     snprintf(buffer, buffer_size,
@@ -69,6 +70,7 @@ static void alloc_gen_free(void *ctx, void *ptr)
     free(ptr);
 }
 
+// TODO: make sure to add space when two tokens cannot paste e.g. | | != ||, a | == a|
 int main(void)
 {
     ZPP_State state = {
@@ -79,13 +81,12 @@ int main(void)
             .gen_calloc  = &alloc_gen_calloc,
             .gen_realloc = &alloc_gen_realloc,
         },
-        .lexer =
-        {
-            .pos.ptr = read_whole_file("Z:/projects/zpp/zpp.h"),
-        },
     };
 
-    if (ZPP_init_state(&state) <= 0) return 1;
+    char *file_data =
+        read_whole_file("zpp.h");
+
+    if (ZPP_init_state(&state, file_data) <= 0) return 1;
 
     size_t last_row = 0;    
     for(;;)
@@ -106,7 +107,7 @@ int main(void)
             break;
         }
 
-        ZPP_Token token = state.lexer.result;
+        ZPP_Token token = state.result;
         if (token.pos.row != last_row)
         {
             size_t line_difference = token.pos.row - last_row;
@@ -132,29 +133,56 @@ int main(void)
 
     printf("\n\n---------------------\n"
            "Macros defined:\n");
-    for (uint32_t i = 0; i < state.macro_map.cap; ++i)
+    for (uint32_t i = 0; i < state.ident_map.cap; ++i)
     {
-        if (state.macro_map.keys[i].name.ptr == NULL ||
-            state.macro_map.keys[i].is_dead)
+        if (!state.ident_map.keys[i].is_alive ||
+            !state.ident_map.keys[i].is_macro)
         {
             continue;
         }
+        
+        ZPP_Ident *macro = &state.ident_map.keys[i];
 
         printf("#define %.*s",
-               (int)state.macro_map.keys[i].name.len,
-               state.macro_map.keys[i].name.ptr);
+               (int)macro->name.len, macro->name.ptr);
 
-        ZPP_Macro *macro = &state.macro_map.keys[i];
+        if (macro->is_fn_macro)
+        {
+            printf("(");
+            for (uint32_t j = 0; j < macro->arg_len; ++j)
+            {
+                printf("%.*s",
+                       (int)macro->args[j].len,
+                       macro->args[j].ptr);
+
+                if (j + 1 < macro->arg_len)
+                {
+                    printf(", ");
+                }
+            }
+            printf(")");
+        }
+
+        printf(" ");
+            
         for (uint32_t j = 0; j < macro->token_len; ++j)
         {
-            if((macro->tokens[j].flags & ZPP_TOKEN_SPACE) != 0)
+            ZPP_Token token = macro->tokens[j];
+            if((token.flags & ZPP_TOKEN_SPACE) != 0)
             {
                 fputc(' ', stdout);
             }
-            
-            printf("%.*s",
-                   (int)macro->tokens[j].len,
-                   macro->tokens[j].pos.ptr);
+
+            if ((token.flags & ZPP_TOKEN_MACRO_ARG) != 0)
+            {
+                ZPP_String arg = macro->args[(uintptr_t)token.pos.ptr];
+                token = (ZPP_Token) {
+                    .len = arg.len,
+                    .pos.ptr = arg.ptr, 
+                };
+            }
+
+            printf("%.*s", (int)token.len, token.pos.ptr);
         }
 
         printf("\n");
