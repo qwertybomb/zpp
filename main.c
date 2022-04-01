@@ -14,8 +14,13 @@ static char *read_whole_file(char const *path)
 {
     FILE *file = fopen(path, "rb");
 
+    if (file == NULL)
+    {
+        return NULL;
+    }
+    
     fseek(file, 0, SEEK_END);
-    size_t file_size = ftell(file);
+    size_t file_size = (size_t)ftell(file);
     fseek(file, 0, SEEK_SET);
 
     char *result = malloc(file_size + 1);
@@ -71,8 +76,9 @@ static void alloc_gen_free(void *ctx, void *ptr)
 }
 
 // TODO: make sure to add space when two tokens cannot paste e.g. | | != ||, a | == a|
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc;
     ZPP_State state = {
         .allocator = &(ZPP_Allocator)
         {
@@ -84,8 +90,10 @@ int main(void)
     };
 
     char *file_data =
-        read_whole_file("zpp.h");
+        read_whole_file(argv[1]);
 
+    if (file_data == NULL) return 1;
+    
     if (ZPP_init_state(&state, file_data) <= 0) return 1;
 
     size_t last_row = 0;    
@@ -144,7 +152,7 @@ int main(void)
         ZPP_Ident *macro = &state.ident_map.keys[i];
 
         printf("#define %.*s",
-               (int)macro->name.len, macro->name.ptr);
+               (int)macro->name_len, macro->name);
 
         if (macro->is_fn_macro)
         {
@@ -175,9 +183,9 @@ int main(void)
 
             if ((token.flags & ZPP_TOKEN_MACRO_ARG) != 0)
             {
-                ZPP_String arg = macro->args[(uintptr_t)token.pos.ptr];
+                ZPP_String arg = macro->args[token.len];
                 token = (ZPP_Token) {
-                    .len = arg.len,
+                    .len = (uint32_t)arg.len,
                     .pos.ptr = arg.ptr, 
                 };
             }
@@ -186,5 +194,6 @@ int main(void)
         }
 
         printf("\n");
+        fflush(stdout);
     }
 }
