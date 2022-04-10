@@ -1,4 +1,4 @@
-CC=clang-cl
+CC=cl
 SRC=main.c
 BIN=prog.exe
 MODE=DEBUG

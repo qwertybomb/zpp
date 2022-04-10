@@ -43,6 +43,7 @@ static void ZPP_format_error(ZPP_Error const *error,
         [ZPP_ERROR_UNEXPECTED_EOL]   = "unexpected eol found",
         [ZPP_ERROR_UNEXPECTED_TOK]   = "unexpected token found",
         [ZPP_ERROR_INVALID_MACRO] = "invalid macro found",
+        [ZPP_ERROR_INVALID_PASTE] = "invalid paste formed",
     };
     
     snprintf(buffer, buffer_size,
