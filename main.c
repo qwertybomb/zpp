@@ -90,11 +90,9 @@ int main(int argc, char **argv)
         },
     };
 
-    char *file_data =
-        read_whole_file(argv[1]);
+    char *file_data = argc > 1 ? read_whole_file(argv[1]) : NULL;
 
     if (file_data == NULL) return 1;
-    
     if (ZPP_init_state(&state, file_data) <= 0) return 1;
 
     size_t last_row = 0;    
@@ -140,6 +138,7 @@ int main(int argc, char **argv)
         fwrite(token.pos.ptr, 1, token.len, stdout);
     }
 
+#if 0
     printf("\n\n---------------------\n"
            "Macros defined:\n");
     for (uint32_t i = 0; i < state.ident_map.cap; ++i)
@@ -197,4 +196,6 @@ int main(int argc, char **argv)
         printf("\n");
         fflush(stdout);
     }
+#endif
+
 }

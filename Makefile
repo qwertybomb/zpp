@@ -10,7 +10,7 @@ LINK_FLAGS=-link -incremental:no -out:$(BIN)
 FLAGS=$(FLAGS) -Od -Zi
 LINK_FLAGS=$(LINK_FLAGS) -debug
 !ELSE
-FLAGS=$(FLAGS) -O2 -Oi
+FLAGS=$(FLAGS) -O2 -Oi -Zi
 !ENDIF
 
 !IF "$(CC)" == "clang-cl"
