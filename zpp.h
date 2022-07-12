@@ -1304,11 +1304,9 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
         // #define foo(x) [x]
         // #define bar foo(bar
         // #define buz bar)
-        // we would need to make sure not to expand the bar in `foo(bar` 
-        int was_fn_macro = 0;
+        // we would need to make sure not to expand the bar in `foo(bar`
         for(ptrdiff_t scope_level = 1;;)
         {
-            if (was_fn_macro != 0) --was_fn_macro;
             ZPP_LEXER_TRY_READ_FULL(state, error);
             
             if (*state->result.pos.ptr == ')')
@@ -1319,19 +1317,19 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
                     goto push_token;
                 }
 
-                // return an error if the macro did not have enough arguments
-                if (ident->arg_len != macro_args.len &&
-                    (!ident->is_va_args || macro_args.len < ident->arg_len - 1))
-                {
-                    return ZPP_return_error(&state->result.pos, error,
-                                            ZPP_ERROR_INVALID_MACRO);
-                }
-
-                // handle the case where __VA_ARGS__ is passed nothing 
-                if (ident->is_va_args && macro_args.len != ident->arg_len)
+                // handle the case where arguments can omitted
+                if (macro_args.len != ident->arg_len &&
+                    (ident->is_va_args || ident->arg_len == 1))
                 {
                     macro_args.len = ident->arg_len;
                     macro_args.u.tok_arr[macro_args.len - 1] = (ZPP_TokenArray){0};
+                }
+
+                // return an error if the macro did not have enough arguments
+                if (ident->arg_len != macro_args.len)
+                {
+                    return ZPP_return_error(&state->result.pos, error,
+                                            ZPP_ERROR_INVALID_MACRO);
                 }
 
                 break;
@@ -1344,16 +1342,9 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
 
             if (*state->result.pos.ptr == '(')
             {
-                if (was_fn_macro != 0)
-                {
-                    ZPP_TokenArray *current =
-                        &macro_args.u.tok_arr[macro_args.len - 1];
-                    current->ptr[current->len - 1].flags |= ZPP_TOKEN_NO_EXPAND;
-                }
-                
                 ++scope_level;
             }
-            else if (*state->result.pos.ptr == ',')
+            else if (*state->result.pos.ptr == ',' && scope_level < 2)
             {
                 // we have a new argument
                 if (macro_args.len != ident->arg_len)
@@ -1402,14 +1393,8 @@ push_token:;
             current->ptr[current->len - 1].pos.ptr = (char*)arg_ident;
             current->ptr[current->len - 1].flags |= ZPP_TOKEN_IDENT_PTR;
 
-            if (!arg_ident->disabled) continue;
-
-            if (arg_ident->is_fn_macro)
-            {
-                was_fn_macro = 2;
-            }
-            else
-            {
+            if (arg_ident->disabled)
+            {        
                 current->ptr[current->len - 1].flags |= ZPP_TOKEN_NO_EXPAND;
             }
         }
