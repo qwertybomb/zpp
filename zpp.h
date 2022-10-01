@@ -33,7 +33,7 @@ enum
     ZPP_TOKEN_STR   = 1 << 6, // token is a "string" L"literal"
     ZPP_TOKEN_CHAR  = 1 << 7, // token is a {L'c', 'h', 'a', 'r', ' ', l', 't', 'e', 'r', 'a', L'l'}
     ZPP_TOKEN_ALLOC = 1 << 8, // this token is dynamically allocated
-    ZPP_TOKEN_MACRO = 1 << 9, // NOTE: internal use only
+    ZPP_TOKEN_READY = 1 << 9,
     ZPP_TOKEN_MACRO_ARG = 1 << 10,
     ZPP_TOKEN_NO_EXPAND = 1 << 11,
     ZPP_TOKEN_IDENT_PTR = 1 << 12,
@@ -45,6 +45,42 @@ enum
     ZPP_CONTEXT_MACRO = 1 << 1,
     ZPP_CONTEXT_LOCK = 1 << 2,
     ZPP_CONTEXT_TYPES = ~(ZPP_CONTEXT_LOCK),
+};
+
+enum
+{
+    ZPP_LEXER_PP = 1 << 0,
+    ZPP_LEXER_BOL = 1 << 1,
+};
+
+// NOTE: the first 127 values are just the normal ascii values
+enum
+{
+    ZPP_TYPE_XORQ = 128, // ^=
+    ZPP_TYPE_ADDQ,       // +=
+    ZPP_TYPE_SUBQ,       // -=
+    ZPP_TYPE_MULQ,       // *=
+    ZPP_TYPE_DIVQ,       // /=
+    ZPP_TYPE_ANDQ,       // &=
+    ZPP_TYPE_ORQ,        // |=
+    ZPP_TYPE_MODQ,       // %=
+    ZPP_TYPE_NOTQ,       // !=
+    ZPP_TYPE_EQQ,        // ==
+    ZPP_TYPE_ADD2,       // ++
+    ZPP_TYPE_SUB2,       // --
+    ZPP_TYPE_AND2,       // &&
+    ZPP_TYPE_OR2,        // ||
+    ZPP_TYPE_SHIFTR,     // >>
+    ZPP_TYPE_SHIFTL,     // <<
+    ZPP_TYPE_SHIFTRQ,    // >>=
+    ZPP_TYPE_SHIFTLQ,    // <<=
+    ZPP_TYPE_LT,         // <
+    ZPP_TYPE_GT,         // >
+    ZPP_TYPE_LTQ,        // <=
+    ZPP_TYPE_GTQ,        // >=
+    ZPP_TYPE_HASH2,      // ##
+    ZPP_TYPE_DOT3,       // ...
+    ZPP_TYPE_SUBGT,      // ->
 };
 
 // TODO: fix error code system
@@ -79,13 +115,15 @@ typedef struct
 {
     ZPP_Pos pos;
     uint32_t len; // NOTE: this also stores macro arg index sometimes
-    uint32_t flags;
+    uint32_t flags : 16;
+    uint32_t type : 16;
 } ZPP_Token;
 
 typedef struct
 {
     ZPP_Token *ptr;
-    size_t len;
+    uint32_t len;
+    uint32_t cap;
 } ZPP_TokenArray;
 
 typedef struct
@@ -102,12 +140,12 @@ typedef struct
 typedef struct
 {
     ZPP_Context base;
-    uint32_t tok_flags;
+    uint32_t flags : 3;
+    uint32_t bstack_len : 29;
     
     ZPP_Pos pos;
     ZPP_Token result;
-    
-    bool in_pp_directive : 1;
+    uint32_t bstack[4];
 } ZPP_Lexer;
 
 typedef struct 
@@ -164,7 +202,7 @@ typedef union
     ZPP_Context base;
     ZPP_MacroContext macro_context;
 } ZPP_ContextBlock;
-
+                   
 typedef struct
 {
     size_t len;
@@ -209,13 +247,26 @@ ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error);
 
 #define ZPP_LEXER_TRY_READ_FULL(s_, e_)                             \
     do                                                              \
-    {    ec = ZPP_context_lex_direct(s_, e_, NULL);                 \
+    {                                                               \
+        ec = ZPP_context_lex_direct(s_, e_, NULL);                  \
         if (ec < 0) return ec;                                      \
         if (ec == 0)                                                \
         {                                                           \
             return ZPP_return_error(&(s_)->result.pos, e_,          \
-                                    ZPP_ERROR_UNEXPECTED_EOF);      \
+                                    ZPP_ERROR_UNEXPECTED_EOL);      \
         }                                                           \
+    } while (false)
+
+#define ZPP_DIRECTIVE_IF_READ(s_, e_)                                \
+    do                                                               \
+    {                                                                \
+        ec = ZPP_read_token(s_, e_);                                 \
+        if (ec < 0) return ec;                                       \
+        if (ec == 0)                                                 \
+        {                                                            \
+            return ZPP_return_error(&(s_)->result.pos, e_,           \
+                                    ZPP_ERROR_UNEXPECTED_EOL);       \
+        }                                                            \
     } while (false)
 
 
@@ -266,6 +317,31 @@ static int ZPP_return_error(ZPP_Pos *pos,
     error->error_code = error_code;
     return -1;
 }
+
+// NOTE: assumes uint32_t is 4 bytes
+static int ZPP_lexer_btop(ZPP_ContextBlock *context)
+{
+    if ((context->base.flags & ZPP_CONTEXT_FILE) == 0) return -1;
+
+    ZPP_Lexer *lexer = &context->lexer;
+    if (lexer->bstack_len == 0) return -1;
+    
+    uint32_t bit_index = lexer->bstack_len - 1;
+    return (lexer->bstack[bit_index / 32] >> bit_index % 32) & 0x1;
+}
+
+static void ZPP_lexer_bpop(ZPP_Lexer *lexer)
+{
+    --lexer->bstack_len;
+}
+
+static void ZPP_lexer_bpush(ZPP_Lexer *lexer, bool bit)
+{
+    uint32_t bit_index = lexer->bstack_len++;
+    lexer->bstack[bit_index / 32] &= ~((uint32_t)0x1 << bit_index % 32);
+    lexer->bstack[bit_index / 32] |= (uint32_t)bit << bit_index % 32;
+}
+
 
 // NOTE: before using this remember to save the old location
 static char ZPP_lexer_read_char(ZPP_Lexer *lexer)
@@ -356,8 +432,12 @@ static int ZPP_lexer_read_ident_rest(ZPP_Lexer *lexer,
 
 static int ZPP_lexer_lex_direct(ZPP_Lexer *lexer, ZPP_Error *error)
 {
-    lexer->result.flags = lexer->tok_flags;
-    lexer->tok_flags = 0;
+    lexer->result.flags = 0;
+    if ((lexer->flags & ZPP_LEXER_BOL) != 0)
+    {
+        lexer->result.flags = ZPP_TOKEN_BOL;
+    }
+    lexer->flags &= ~(uint32_t)ZPP_LEXER_BOL;
     
     // NOTE: we check for comments later in the giant switch
     for(;;)
@@ -375,7 +455,7 @@ static int ZPP_lexer_lex_direct(ZPP_Lexer *lexer, ZPP_Error *error)
 
         if (*lexer->pos.ptr == '\n')
         {
-            if (lexer->in_pp_directive)
+            if ((lexer->flags & ZPP_LEXER_PP) != 0)
             {
                 return 0;
             }
@@ -424,6 +504,7 @@ eof_found:
          */
 
         char *new_ptr;
+        lexer->result.type = *lexer->pos.ptr; 
         switch (*lexer->pos.ptr)
         {
             case '\'':
@@ -444,13 +525,13 @@ eof_found:
                 lexer->result.len = 1;
                 lexer->result.flags |= ZPP_TOKEN_STR;
                 return ZPP_lexer_read_string_rest(lexer, error, '"');
-            }
+            }  
             
-            case '^': new_ptr = "^="; goto star_case;
-            case '%': new_ptr = "%="; goto star_case;
-            case '!': new_ptr = "!="; goto star_case;
-            case '=': new_ptr = "=="; goto star_case;
-            case '*': new_ptr = "*=";
+            case '^': new_ptr = "^="; lexer->result.type = ZPP_TYPE_XORQ; goto star_case;
+            case '%': new_ptr = "%="; lexer->result.type = ZPP_TYPE_MODQ; goto star_case;
+            case '!': new_ptr = "!="; lexer->result.type = ZPP_TYPE_NOTQ; goto star_case;
+            case '=': new_ptr = "=="; lexer->result.type = ZPP_TYPE_EQQ;  goto star_case;
+            case '*': new_ptr = "*="; lexer->result.type = ZPP_TYPE_MULQ;
             {
 star_case:
                 ++lexer->pos.ptr;
@@ -466,11 +547,12 @@ star_case:
                     lexer->result.pos.ptr = new_ptr;
                     return 1;
                 }
-                lexer->pos = old_pos;
+                lexer->pos = old_pos;                
 
+                lexer->result.type = *lexer->result.pos.ptr;
                 return 1;
             }
-            
+
             case '&':
             case '|':
             case '+':
@@ -489,19 +571,43 @@ star_case:
                 if (ch == start_ch)
                 {
                     lexer->result.len = 2;
-                    lexer->result.pos.ptr =
-                        ch == '&' ? "&&" :
-                        ch == '|' ? "||" : "++";
-
+                    if (ch == '&')
+                    {
+                        lexer->result.pos.ptr = "&&";
+                        lexer->result.type = ZPP_TYPE_AND2;
+                    }
+                    else if (ch == '|')
+                    {
+                        lexer->result.pos.ptr = "||";
+                        lexer->result.type = ZPP_TYPE_OR2;
+                    }
+                    else
+                    {
+                        lexer->result.pos.ptr = "++";
+                        lexer->result.type = ZPP_TYPE_ADD2;
+                    }
+                    
                     return 1;
                 }
                 else if (ch == '=')
                 {
+                    if (ch == '&')
+                    {
+                        lexer->result.pos.ptr = "&=";
+                        lexer->result.type = ZPP_TYPE_ANDQ;
+                    }
+                    else if (ch == '|')
+                    {
+                        lexer->result.pos.ptr = "|=";
+                        lexer->result.type = ZPP_TYPE_ORQ;
+                    }
+                    else
+                    {
+                        lexer->result.pos.ptr = "+=";
+                        lexer->result.type = ZPP_TYPE_ADDQ;
+                    }
                     lexer->result.len = 2;
-                    lexer->result.pos.ptr =
-                        start_ch == '&' ? "&=" :
-                        start_ch == '|' ? "|=" : "+=";
-                    
+
                     return 1;   
                 }
                 
@@ -513,34 +619,34 @@ star_case:
             {
                 ++lexer->pos.col;
                 ++lexer->pos.ptr;
-
-                lexer->result.len = 1;
                 lexer->result.flags |= ZPP_TOKEN_PUNCT;
 
                 ZPP_Pos old_pos = lexer->pos;
                 {
+                    lexer->result.len = 2;
                     char ch = ZPP_lexer_read_char(lexer);
                     if (ch == '>')
                     {
-                        lexer->result.len = 2;
                         lexer->result.pos.ptr = "->";
+                        lexer->result.type = ZPP_TYPE_SUBGT;
                         return 1;
                     }
                     else if (ch == '=')
                     {
-                        lexer->result.len = 2;
                         lexer->result.pos.ptr = "-=";
+                        lexer->result.type = ZPP_TYPE_SUBQ;
                         return 1;
                     }
                     else if (ch == '-')
                     {
-                        lexer->result.len = 2;
                         lexer->result.pos.ptr = "--";
+                        lexer->result.type = ZPP_TYPE_SUB2;
                         return 1;
                     }
                 }
                 lexer->pos = old_pos;
 
+                lexer->result.len = 1;
                 return 1;
             }
             
@@ -556,6 +662,7 @@ star_case:
                 {
                     lexer->result.len = 3;
                     lexer->result.pos.ptr = "...";
+                    lexer->result.type = ZPP_TYPE_DOT3;
                     return 1;
                 }
                 lexer->pos = old_pos;
@@ -582,29 +689,56 @@ star_case:
                     case '>':
                     case '<':
                     {
-                        if (start_ch == ch)
+                        if (start_ch != ch) break;
+                        
+                        ZPP_Pos old_pos2 = lexer->pos;
+                        if (ZPP_lexer_read_char(lexer) != '=')
                         {
-                            ZPP_Pos old_pos2 = lexer->pos;
-                            if (ZPP_lexer_read_char(lexer) != '=')
+                            lexer->result.len = 2;
+                            if (start_ch == '<')
                             {
-                                lexer->result.len = 2;
-                                lexer->result.pos.ptr = start_ch == '<' ? "<<" : ">>";
-                                lexer->pos = old_pos2;
-                                return 1;
+                                lexer->result.pos.ptr = "<<";
+                                lexer->result.type = ZPP_TYPE_SHIFTL;
                             }
-                                
-                            lexer->result.len = 3;
-                            lexer->result.pos.ptr = start_ch == '<' ? "<<=" : ">>=";
+                            else
+                            {
+                                lexer->result.pos.ptr = ">>";
+                                lexer->result.type = ZPP_TYPE_SHIFTR;
+                            }
+                                                    
+                            lexer->pos = old_pos2;
                             return 1;
                         }
-
-                        break;
+                                
+                        lexer->result.len = 3;
+                        if (start_ch == '<')
+                        {
+                            lexer->result.pos.ptr = "<<=";
+                            lexer->result.type = ZPP_TYPE_SHIFTLQ;
+                        }
+                        else
+                        {
+                            lexer->result.pos.ptr = ">>=";
+                            lexer->result.type = ZPP_TYPE_SHIFTRQ;
+                        }
+                        
+                        return 1;
                     }
                         
                     case '=':
                     {
                         lexer->result.len = 2;
-                        lexer->result.pos.ptr = start_ch == '<' ? "<=" : ">=";
+                        if (start_ch == '<')
+                        {
+                            lexer->result.pos.ptr = "<=";
+                            lexer->result.type = ZPP_TYPE_LTQ;
+                        }
+                        else
+                        {
+                            lexer->result.pos.ptr = ">=";
+                            lexer->result.type = ZPP_TYPE_GTQ;
+                        }
+                        
                         return 1;
                     }
                 }                    
@@ -628,6 +762,7 @@ star_case:
                     {
                         ++lexer->result.len;
                         lexer->result.pos.ptr = "##";
+                        lexer->result.type = ZPP_TYPE_HASH2;
                         return 1;
                     }
                 }
@@ -667,27 +802,23 @@ star_case:
                 {
                     lexer->result.flags |= ZPP_TOKEN_BOL;
                     lexer->result.flags &= ~ZPP_TOKEN_SPACE;
-                    for(;;)
+
+                    char cur;
+                    while ((cur = ZPP_lexer_read_char(lexer)) != '\n')
                     {
-                        char cur = ZPP_lexer_read_char(lexer);
-                            
-                        if (cur == '\n')
-                        {
-                            if (lexer->in_pp_directive)
-                            {
-                                return 0;
-                            }
-                            
-                            ++lexer->pos.row;
-                            lexer->pos.col = 0;
-                            break;
-                        }
-                        else if (cur == '\0')
+                        if (cur == '\0')
                         {
                             goto eof_found;
                         }
                     }
 
+                    if ((lexer->flags & ZPP_LEXER_PP) != 0)
+                    {
+                        return 0;
+                    }
+                            
+                    ++lexer->pos.row;
+                    lexer->pos.col = 0;
                     continue;
                 }
                 else if (ch == '*')
@@ -865,7 +996,7 @@ static int ZPP_context_lex_direct(ZPP_State *state, ZPP_Error *error,
             
                 return result;
             }
-
+ 
             case ZPP_CONTEXT_MACRO:
             {
                 ZPP_MacroContext *macro_context =
@@ -1017,20 +1148,27 @@ static ZPP_String ZPP_tok_to_str(ZPP_Token *token)
 
 ZPP_LINKAGE int ZPP_init_state(ZPP_State *state, char *file_data)
 {
-    state->ident_map.cap = 512;
-    state->ident_map.keys =
-        ZPP_gen_calloc(state,
-                       state->ident_map.cap *
-                       sizeof *state->ident_map.keys);
-    
-    ZPP_context_push(state, &(ZPP_ContextBlock)
-                     {
-                         .lexer = {
-                             .pos.ptr = file_data,
-                             .tok_flags = ZPP_TOKEN_BOL,
-                             .base.flags = ZPP_CONTEXT_FILE,
-                         }
-                     });
+    if (state->ident_map.keys == NULL)
+    {
+        state->ident_map.cap = 512;
+        state->ident_map.keys =
+            ZPP_gen_calloc(state,
+                           state->ident_map.cap *
+                           sizeof *state->ident_map.keys);
+    }
+
+
+    if (file_data != NULL)
+    {
+        ZPP_context_push(state, &(ZPP_ContextBlock)
+                         {
+                             .lexer = {
+                                 .pos.ptr = file_data,
+                                 .flags = ZPP_LEXER_BOL,
+                                 .base.flags = ZPP_CONTEXT_FILE,
+                             }
+                         });
+    }
     
     return 1;
 }
@@ -1077,85 +1215,6 @@ static int ZPP_paste_tokens(ZPP_State *state, ZPP_Error *error,
     return 1;
 }
 
-// TODO: fix this and use it later for when we only expand arguments as needed
-#if 0
-static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro);
-
-static int ZPP_expand_macro_arg(ZPP_State *state,
-                                ZPP_Error *error,
-                                ZPP_TokenArray macro_arg,
-                                ZPP_TokenArray *result_arg,
-                                ZPP_ContextBlock *old_context)
-{
-    ZPP_Ident *old_parent_macro = NULL;
-    if (state->context != old_context &&
-        (old_context->base.flags & ZPP_CONTEXT_TYPES) == ZPP_CONTEXT_MACRO)
-    {
-        // NOTE: this assumes that this macro context actually has a macro
-        old_parent_macro = old_context->macro_context.macro;
-        old_parent_macro->disabled = true;
-    }
-
-    ZPP_context_push(state,
-                     &(ZPP_ContextBlock)
-                     {
-                         .macro_context = {
-                             .base.flags =
-                             ZPP_CONTEXT_MACRO | ZPP_CONTEXT_LOCK,
-                             .macro = NULL,
-                             .tokens = macro_arg.ptr,
-                             .token_len = (uint32_t)macro_arg.len,
-                             .token_total = (uint32_t)macro_arg.len,
-                         }
-                     });
-
-    size_t token_args_cap = 0;
-    *result_arg = (ZPP_TokenArray){0};
-    for(;;)
-    {
-        int ec;
-        if ((ec = ZPP_context_lex_direct(state, error, NULL)) < 0)
-        {
-            return ec;
-        }
-
-        if (ec == 0) break;
-                
-        bool token_had_macro = false;
-        if ((ec = ZPP_expand_macro(state, error, &token_had_macro)) < 0)
-        {
-            return ec;
-        }
-
-        if (token_had_macro)
-        {
-            continue;
-        }
-
-        if (++result_arg->len > token_args_cap)
-        {
-            token_args_cap = (token_args_cap + 1) * 3 / 2;
-            result_arg->ptr = ZPP_gen_realloc(state,
-                                              result_arg->ptr,
-                                              token_args_cap *
-                                              sizeof *result_arg->ptr);
-        }
-
-        result_arg->ptr[result_arg->len - 1] = state->result; 
-   }
-
-    // remove current locked context
-    state->context = &state->context_mem.u.ctx[--state->context_mem.len - 1];
-
-    if (old_parent_macro != NULL)
-    {
-        old_parent_macro->disabled = false;
-    }
-
-    return 1;
-}
-#endif
-
 static void ZPP_fix_ident_token(ZPP_Token *token)
 {
     if ((token->flags & ZPP_TOKEN_IDENT_PTR) != 0)
@@ -1182,9 +1241,9 @@ static int ZPP_stringize_arg(ZPP_State *state, ZPP_Error *error,
     ZPP_GenArray result_str = {
         .u.ptr = ZPP_gen_alloc(state, 2),
         .cap = 2,
+        .len = 2
     };
 
-    ++result_str.len;
     result_str.u.ptr[0] = '"';
 
     // append each token to the result string
@@ -1195,20 +1254,90 @@ static int ZPP_stringize_arg(ZPP_State *state, ZPP_Error *error,
         bool has_space =
             i != 0 && (tok.flags & (ZPP_TOKEN_SPACE | ZPP_TOKEN_BOL)) != 0;
         
-        ZPP_GEN_ARRAY_GROW(state, &result_str, char, tok.len + has_space + 1);
-        if (has_space) result_str.u.ptr[result_str.len - tok.len - 1] = ' ';
-        ZPP_memcpy(result_str.u.ptr + result_str.len - tok.len, tok.pos.ptr, tok.len);
+        ZPP_GEN_ARRAY_GROW(state, &result_str, char, tok.len + has_space);
+        if (has_space) result_str.u.ptr[result_str.len - tok.len - 2] = ' ';
+        ZPP_memcpy(result_str.u.ptr + result_str.len - tok.len - 1, tok.pos.ptr, tok.len);
     }
     
     // NOTE: there will always be enough memory for a closing quote
-    result_str.u.ptr[result_str.len] = '"';
-    ++result_str.len;
+    result_str.u.ptr[result_str.len - 1] = '"';
     
     // NOTE: assumes result is a `#` token
     result->len = (uint32_t)result_str.len;
     result->pos.ptr = result_str.u.ptr;
     result->flags ^= (uint32_t)ZPP_TOKEN_PUNCT | (uint32_t)ZPP_TOKEN_STR;
     
+    return 1;
+}
+
+static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro);
+static int ZPP_expand_macro_arg(ZPP_State *state,
+                                ZPP_Error *error,
+                                ZPP_TokenArray *macro_arg)
+{
+    ZPP_TokenArray current_arg = *macro_arg;
+    ZPP_context_push(state,
+                     &(ZPP_ContextBlock)
+                     {
+                         .macro_context = {
+                             .base.flags =
+                             ZPP_CONTEXT_MACRO | ZPP_CONTEXT_LOCK,
+                             .macro = NULL,
+                             .tokens = current_arg.ptr,
+                             .token_len = (uint32_t)current_arg.len,
+                             .token_total = (uint32_t)current_arg.len,
+                         }
+                     });
+
+    ZPP_TokenArray new_tok_arr = {0};
+    for(;;)
+    {
+        int ec;
+        if ((ec = ZPP_context_lex_direct(state, error, NULL)) < 0)
+        {
+            return ec;
+        }
+                
+        if (ec == 0)
+        {
+            // remove all modifications done to the normal args
+            for (size_t j = 0; j < current_arg.len; ++j)
+            {
+                macro_arg->ptr[j].flags &= ~(uint32_t)ZPP_TOKEN_NO_EXPAND;
+                ZPP_fix_ident_token(&current_arg.ptr[j]);
+            }
+                    
+            break;
+        }
+                
+        bool token_had_macro = false;
+        if ((ec = ZPP_expand_macro(state, error, &token_had_macro)) < 0)
+        {
+            return ec;
+        }
+        
+        if (token_had_macro)
+        {
+            continue;
+        }
+
+        if (++new_tok_arr.len > new_tok_arr.cap)
+        {
+            new_tok_arr.cap = (new_tok_arr.cap + 1) * 3 / 2;
+            new_tok_arr.ptr = ZPP_gen_realloc(state,
+                                              new_tok_arr.ptr,
+                                              new_tok_arr.cap *
+                                              sizeof *new_tok_arr.ptr);
+        }
+
+        new_tok_arr.ptr[new_tok_arr.len - 1] = state->result;
+    }
+
+    ZPP_gen_free(state, macro_arg->ptr);
+    *macro_arg = new_tok_arr;
+    
+    // remove current locked context
+    state->context = &state->context_mem.u.ctx[--state->context_mem.len - 1];
     return 1;
 }
 
@@ -1228,7 +1357,6 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
         ZPP_fix_ident_token(&state->result);
         return 1;
     }
-
     
     ZPP_Ident *ident;
     ZPP_String name_str = {0};
@@ -1374,7 +1502,6 @@ push_token:;
                                                token_args_cap *
                                                sizeof *current->ptr);
             }
-
             current->ptr[current->len - 1] = state->result;
 
             if ((state->result.flags & ZPP_TOKEN_IDENT) == 0)
@@ -1400,76 +1527,32 @@ push_token:;
         }
 
         expand_macro_args = (ZPP_GenArray) {
-            .u.tok_arr = ZPP_gen_calloc(state,
-                                        ident->arg_len *
-                                        sizeof *macro_args.u.tok_arr),
+            .u.tok_arr = ZPP_gen_alloc(state,
+                                       ident->arg_len *
+                                       sizeof *macro_args.u.tok_arr),
             .len = ident->arg_len,
         };
 
-        // TODO: do this as needed and not all at once
-        // macro expand each macro argument
         for (uint32_t i = 0; i < macro_args.len; ++i)
         {
-            ZPP_TokenArray current_arg = macro_args.u.tok_arr[i];
-            ZPP_context_push(state,
-                             &(ZPP_ContextBlock)
-                             {
-                                 .macro_context = {
-                                     .base.flags =
-                                     ZPP_CONTEXT_MACRO | ZPP_CONTEXT_LOCK,
-                                     .macro = NULL,
-                                     .tokens = current_arg.ptr,
-                                     .token_len = (uint32_t)current_arg.len,
-                                     .token_total = (uint32_t)current_arg.len,
-                                 }
-                             });
+            ZPP_TokenArray src =
+                macro_args.u.tok_arr[i];
+            
+            ZPP_TokenArray copy = {
+                .ptr = ZPP_gen_alloc(state,
+                                     src.len * sizeof *src.ptr),
+                .len = src.len,
+            };
 
-            token_args_cap = 0;
-            for(;;)
+            ZPP_memcpy(copy.ptr, src.ptr, src.len * sizeof *src.ptr);
+            expand_macro_args.u.tok_arr[i] = copy;
+
+            // fix unexpanded macros
+            for (uint32_t j = 0; j < src.len; ++j)
             {
-                if ((ec = ZPP_context_lex_direct(state, error, NULL)) < 0)
-                {
-                    return ec;
-                }
-                
-                if (ec == 0)
-                {
-                    // remove all modifications done to the normal args
-                    for (size_t j = 0; j < current_arg.len; ++j)
-                    {
-                        current_arg.ptr[j].flags &= ~(uint32_t)ZPP_TOKEN_NO_EXPAND;
-                        ZPP_fix_ident_token(&current_arg.ptr[j]);
-                    }
-                    
-                    break;
-                }
-                
-                bool token_had_macro = false;
-                if ((ec = ZPP_expand_macro(state, error, &token_had_macro)) < 0)
-                {
-                    return ec;
-                }
-
-                if (token_had_macro)
-                {
-                    continue;
-                }
-
-                ZPP_TokenArray *current = &expand_macro_args.u.tok_arr[i];
-                if (++current->len > token_args_cap)
-                {
-                    token_args_cap = (token_args_cap + 1) * 3 / 2;
-                    current->ptr = ZPP_gen_realloc(state,
-                                                   current->ptr,
-                                                   token_args_cap *
-                                                   sizeof *current->ptr);
-                }
-
-                current->ptr[current->len - 1] = state->result;
+                ZPP_fix_ident_token(&src.ptr[j]);
+                src.ptr[j].flags &= ~(uint32_t)ZPP_TOKEN_NO_EXPAND;
             }
-
-            // remove current locked context
-            state->context = &state->context_mem.u.ctx[--state->context_mem.len - 1];
         }
     }
 
@@ -1515,21 +1598,36 @@ push_token:;
             
             if ((ident->tokens[i].flags & ZPP_TOKEN_MACRO_ARG) != 0)
             {
-                ZPP_GenArray macro_args_choice = 
-                    is_paste_next ? macro_args : expand_macro_args;
-    
-                ZPP_TokenArray arg =
-                    macro_args_choice.u.tok_arr[ident->tokens[i].len];
+                ZPP_TokenArray *arg;
+                if (!is_paste_next)
+                {
+                    arg =
+                        &expand_macro_args.u.tok_arr[ident->tokens[i].len];
+
+                    if (arg->cap != UINT32_MAX &&
+                        (ec = ZPP_expand_macro_arg(state, error, arg)) < 0)
+                    {
+                        return ec;
+                    }
+                    else
+                    {
+                        arg->cap = UINT32_MAX;
+                    }
+                }
+                else
+                {
+                    arg = &macro_args.u.tok_arr[ident->tokens[i].len];
+                }
                 
                 // if the arg is empty we don't need to append anything
-                if (arg.len == 0)
+                if (arg->len == 0)
                 {
                     is_lhs_empty = true;
                 }
 
-                ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, arg.len);
-                ZPP_memcpy(tokens.u.tok + tokens.len - arg.len,
-                           arg.ptr, arg.len * sizeof *tokens.u.tok);
+                ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, arg->len);
+                ZPP_memcpy(tokens.u.tok + tokens.len - arg->len,
+                           arg->ptr, arg->len * sizeof *tokens.u.tok);
             }
             else
             {
@@ -1538,63 +1636,77 @@ push_token:;
             }
 
 was_stringize:;
-            if (is_paste_next)
+            if (!is_paste_next) continue;            
+            do
             {
-                do
+                i += 2;
+                if ((ident->tokens[i].flags & ZPP_TOKEN_MACRO_ARG) != 0)
                 {
-                    i += 2;
-                    if ((ident->tokens[i].flags & ZPP_TOKEN_MACRO_ARG) != 0)
+                    bool is_tok_va_args =
+                        ident->is_va_args &&
+                        ident->tokens[i].len == ident->arg_len - 1; 
+
+                    ZPP_TokenArray arg =
+                        macro_args.u.tok_arr[ident->tokens[i].len];
+                        
+                    // if the arg is empty we don't need to append anything
+                    if (arg.len == 0)
                     {
-                        bool is_tok_va_args =
-                            ident->is_va_args &&
-                            ident->tokens[i].len == ident->arg_len - 1; 
-
-                        ZPP_TokenArray arg =
-                            macro_args.u.tok_arr[ident->tokens[i].len];
-                        
-                        // if the arg is empty we don't need to append anything
-                        if (arg.len == 0)
+                        // TODO: maybe have this as an option
+                        // NOTE: GNU extension __VA_ARGS__ comma omission
+                        // ,##__VA_ARGS__ becomes empty when __VA_ARGS__ is empty
+                        if (!is_lhs_empty && is_tok_va_args &&
+                            *tokens.u.tok[tokens.len - 1].pos.ptr == ',')
                         {
-                            // TODO: maybe have this as an option
-                            // NOTE: GNU extension __VA_ARGS__ comma omission
-                            // ,##__VA_ARGS__ becomes empty when __VA_ARGS__ is empty 
-                            if (!is_lhs_empty && is_tok_va_args &&
-                                *tokens.u.tok[tokens.len - 1].pos.ptr == ',')
-                            {
-                                --tokens.len;
-                            }
-
-                            continue;
+                            --tokens.len;
                         }
 
-                        bool arg_skip = !is_lhs_empty;
-                        if (!is_lhs_empty)
-                        {
-                            // NOTE: for gcc ,##__VA_ARGS__ it just appends __VA_ARGS__ 
-                            if (is_tok_va_args &&
-                                *tokens.u.tok[tokens.len - 1].pos.ptr == ',')
-                            {
-                                arg_skip = false;
-                            }
-                            else if ((ec = ZPP_paste_tokens(state, error,
-                                                            &tokens.u.tok[tokens.len - 1],
-                                                            &arg.ptr[0],
-                                                            &ident->tokens[i - 1].pos)) < 0)
-                            {
-                                return ec;
-                            }
-                        }
-                        
-                        ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, arg.len - arg_skip);
-                        ZPP_memcpy(tokens.u.tok + tokens.len -
-                                   arg.len + arg_skip, arg.ptr + arg_skip,
-                                   (arg.len - arg_skip) * sizeof *tokens.u.tok);
+                        continue;
                     }
-                    else if (!is_lhs_empty)
+
+                    bool arg_skip = !is_lhs_empty;
+                    if (!is_lhs_empty)
+                    {
+                        // NOTE: for gcc ,##__VA_ARGS__ it just appends __VA_ARGS__
+                        if (is_tok_va_args &&
+                            *tokens.u.tok[tokens.len - 1].pos.ptr == ',')
+                        {
+                            arg_skip = false;
+                        }
+                        else if ((ec = ZPP_paste_tokens(state, error,
+                                                        &tokens.u.tok[tokens.len - 1],
+                                                        &arg.ptr[0],
+                                                        &ident->tokens[i - 1].pos)) < 0)
+                        {
+                            return ec;
+                        }
+                    }
+                        
+                    ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, arg.len - arg_skip);
+                    ZPP_memcpy(tokens.u.tok + tokens.len -
+                               arg.len + arg_skip, arg.ptr + arg_skip,
+                               (arg.len - arg_skip) * sizeof *tokens.u.tok);
+                }
+                else
+                {
+                    ZPP_Token pasted_tok = ident->tokens[i];
+                    
+                    if ((is_stringize =
+                         ident->tokens[i].len == 1 &&
+                         *ident->tokens[i].pos.ptr == '#') != false)
+                    {
+                        if ((ec = ZPP_stringize_arg(state, error, &pasted_tok,
+                                                    ident->tokens[i + 1], &macro_args)) < 0)
+                        {
+                            return ec;
+                        }
+                    }
+
+                    if (!is_lhs_empty)
                     {
                         if (((ec = ZPP_paste_tokens(state, error,
                                                     &tokens.u.tok[tokens.len - 1],
-                                                    &ident->tokens[i],
+                                                    &pasted_tok,
                                                     &ident->tokens[i - 1].pos)) < 0))
                         {
                             return ec;
@@ -1603,15 +1715,17 @@ was_stringize:;
                     else
                     {
                         ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, 1);
-                        tokens.u.tok[tokens.len - 1] = ident->tokens[i];
+                        tokens.u.tok[tokens.len - 1] = pasted_tok;
                     }
 
-                    // NOTE: then if we reached this point then the lhs is not empty
-                    is_lhs_empty = false;
-                } while (i + 1 < ident->token_len &&
-                        ident->tokens[i + 1].len == 2 &&
-                        *ident->tokens[i + 1].pos.ptr == '#');             
-            }
+                    i += is_stringize;
+                }
+
+                // NOTE: then if we reached this point then the lhs is not empty
+                is_lhs_empty = false;
+            } while (i + 1 < ident->token_len &&
+                     ident->tokens[i + 1].len == 2 &&
+                     *ident->tokens[i + 1].pos.ptr == '#');            
         }
 
         if (tokens.len != 0)
@@ -1647,39 +1761,126 @@ was_stringize:;
     return 1;
 }
 
+static bool ZPP_is_defined(ZPP_State *state, ZPP_Token *macro_tok)
+{
+    ZPP_Ident *ident =
+        ZPP_ident_map_get(state, ZPP_tok_to_str(macro_tok));
+
+    if (ident == NULL)
+    {
+        ZPP_ident_map_set(state,
+                          &(ZPP_Ident)
+                          {
+                              .name = macro_tok->pos.ptr,
+                              .name_len = macro_tok->len,
+                              .is_macro = false,
+                          });
+
+        return false;
+    }
+
+    return ident->is_macro;
+}
+
+static int ZPP_handle_if_pp(ZPP_State *state, ZPP_Error *error, int64_t *result)
+{
+    int ec;
+    ZPP_DIRECTIVE_IF_READ(state, error);
+    if ((state->result.flags & ZPP_TOKEN_IDENT) != 0)
+    {
+        if (ZPP_string_cmp2(ZPP_tok_to_str(&state->result), "defined"))
+        {
+            int is_defined = -1;
+            bool found_paren = false;
+            for(;;)
+            {
+                ZPP_LEXER_TRY_READ_FULL(state, error);
+                if (state->result.type == '(')
+                {
+                    found_paren = true;
+                    continue;
+                }
+                else if (state->result.type == ')')
+                {
+                    if (!found_paren || is_defined == -1)
+                    {
+                        return ZPP_return_error(&state->result.pos, error,
+                                                ZPP_ERROR_UNEXPECTED_TOK);
+                    }
+                    
+                    *result = is_defined;
+                    return 1;
+                }
+                else if ((state->result.flags & ZPP_TOKEN_IDENT) == 0)
+                {
+                    return ZPP_return_error(&state->result.pos, error,
+                                            ZPP_ERROR_UNEXPECTED_TOK);
+                }
+                
+                is_defined = ZPP_is_defined(state, &state->result);
+                if (!found_paren)
+                {
+                    *result = is_defined;
+                    return 1;
+                }
+            }
+        }
+
+        *result = 0;
+        return 1;
+    }
+    else if ((state->result.flags & ZPP_TOKEN_PPNUM) != 0)
+    {
+        // TODO: handle hex numbers and maybe floating point
+        int64_t val = 0;
+        for (uint32_t i = 0; i < state->result.len; ++i)
+        {
+            val = val*10 + state->result.pos.ptr[i] - '0';
+        }
+
+        *result = val;
+        return 1;
+    }
+    
+    return 1;
+}
+
 ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error)
 {
 read_token:;
     int ec;
     ZPP_LEXER_TRY_READ(state, error);
-    
-    bool had_macro = false;
-    if ((ec = ZPP_expand_macro(state, error, &had_macro)) < 0)
-    {
-        return ec;
-    }
 
-    if (had_macro) goto read_token;
+    int blevel =
+        ZPP_lexer_btop(&state->context_mem.u.ctx[state->context_mem.len - 1]);
     
     if (state->result.pos.ptr[0] != '#' ||
         (state->result.flags & ZPP_TOKEN_BOL) == 0)
     {
+        if (blevel == 0) goto read_token;
+        
+        bool had_macro = false;
+        if ((ec = ZPP_expand_macro(state, error, &had_macro)) < 0)
+        {
+            return ec;
+        }
+        
+        if (had_macro) goto read_token;
         return 1;
     }
-
+    
     // NOTE: only a file lexer should be able to return a BOL token
     // meaning that we can directly cast our context to a ZPP_Lexer
-
     ZPP_Lexer *lexer = (ZPP_Lexer*)state->context;
     ZPP_Lexer old_lex = *lexer;
     
-    lexer->in_pp_directive = true;
+    lexer->flags |= ZPP_LEXER_PP;
     switch (ec = ZPP_lexer_lex_direct(lexer, error))
     {
         case 1: break;
         case 0:
         {
-            lexer->in_pp_directive = false;
+            lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
             goto read_token;
         }
               
@@ -1688,7 +1889,8 @@ read_token:;
     
 #define ZPP_DIRECTIVE_TRY_READ(l_, e_)                              \
     do                                                              \
-    {    ec = ZPP_lexer_lex_direct(l_, e_);                         \
+    {                                                               \
+        ec = ZPP_lexer_lex_direct(l_, e_);                          \
         if (ec < 0) return ec;                                      \
         if (ec == 0)                                                \
         {                                                           \
@@ -1696,7 +1898,8 @@ read_token:;
                                     ZPP_ERROR_UNEXPECTED_EOL);      \
         }                                                           \
     } while (false)
-    
+
+    if (blevel == 0) goto pp_level0;
     if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "define"))
     {
         ZPP_DIRECTIVE_TRY_READ(lexer, error);
@@ -1707,16 +1910,10 @@ read_token:;
                                     ZPP_ERROR_UNEXPECTED_TOK);
         }
 
+        // TODO: handle what do when a macro is already defined
         ZPP_Pos name_pos = lexer->result.pos;
         ZPP_String name_str = ZPP_tok_to_str(&lexer->result);
         ZPP_Ident *macro = ZPP_ident_map_get(state, name_str);
-
-        // TODO: handle this
-        if (macro != NULL && macro->is_macro)
-        {
-            __debugbreak();
-            return -1;
-        }
 
         bool first_token = true;
         ZPP_Ident new_macro = {
@@ -1745,7 +1942,7 @@ read_token:;
                     new_macro.tokens = tokens.u.tok;
                     new_macro.token_len = (uint32_t)tokens.len;
                     
-                    lexer->in_pp_directive = false;
+                    lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
                     if (macro == NULL)
                     {
                         ZPP_ident_map_set(state, &new_macro);
@@ -1888,6 +2085,7 @@ read_token:;
             ZPP_ident_map_get(state,
                               ZPP_tok_to_str(&lexer->result));
 
+        // TODO: handle macro not already existing
         if (macro != NULL)
         {
             macro->is_macro = false;
@@ -1902,19 +2100,72 @@ read_token:;
                                         ZPP_ERROR_UNEXPECTED_TOK);
             }
         }
-        else
-        {
-            __debugbreak();
-        }
         
-        lexer->in_pp_directive = false;
+        lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
+    else if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "ifdef"))
+    {
+        ZPP_DIRECTIVE_TRY_READ(lexer, error);
+        
+        if ((lexer->result.flags & ZPP_TOKEN_IDENT) == 0)
+        {
+            return ZPP_return_error(&lexer->result.pos, error,
+                                    ZPP_ERROR_UNEXPECTED_TOK);
+        }
 
-#undef ZPP_DIRECTIVE_TRY_READ
+        ZPP_lexer_bpush(lexer, ZPP_is_defined(state, &lexer->result));
+        lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
+        goto read_token;
+    }
+    else if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "ifndef"))
+    {
+        ZPP_DIRECTIVE_TRY_READ(lexer, error);
+        
+        if ((lexer->result.flags & ZPP_TOKEN_IDENT) == 0)
+        {
+            return ZPP_return_error(&lexer->result.pos, error,
+                                    ZPP_ERROR_UNEXPECTED_TOK);
+        }
 
+        ZPP_lexer_bpush(lexer, !ZPP_is_defined(state, &lexer->result));
+        lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
+        goto read_token;
+    }
+    else if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "if"))
+    {
+        // make it so that macros can't escape this line
+        state->context->base.flags |= ZPP_CONTEXT_LOCK;
+
+        int64_t value; 
+        if ((ec = ZPP_handle_if_pp(state, error, &value)) < 0)
+        {
+            return ec;
+        }
+
+        //state->context->base.flags &= ~(uint32_t)ZPP_CONTEXT_LOCK;
+        ZPP_lexer_bpush(lexer, value != 0);
+        lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
+        goto read_token;
+    }
+    else if (blevel == -1)
+    {
+        *lexer = old_lex;
+        return 1;
+    }
+
+pp_level0:;
+    if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "endif"))
+    {
+        ZPP_lexer_bpop(lexer);
+        lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
+        goto read_token;
+    }
+    
     *lexer = old_lex;
     return 1;
+   
+#undef ZPP_DIRECTIVE_TRY_READ
 }
 
 //#undef ZPP_STR_STATIC

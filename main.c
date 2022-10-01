@@ -6,7 +6,9 @@
 #define ZPP_LINKAGE static
 #include "zpp.h"
 
+#include <time.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 
 // NOTE: only for testing
@@ -32,9 +34,7 @@ static char *read_whole_file(char const *path)
 }
 
 // TODO: maybe put this into the zpp library
-static void ZPP_format_error(ZPP_Error const *error,
-                             char *buffer,
-                             size_t buffer_size)
+static void ZPP_print_error(ZPP_Error const *error)
 {
     static char const *error_messages[] = {
         [ZPP_ERROR_UNEXPECTED_EOF]   = "unexpected eof found",
@@ -46,10 +46,9 @@ static void ZPP_format_error(ZPP_Error const *error,
         [ZPP_ERROR_INVALID_PASTE] = "invalid paste formed",
     };
     
-    snprintf(buffer, buffer_size,
-             "<source>:%u:%u: error: %s",
-             error->row + 1, error->col,
-             error_messages[error->error_code]);
+    printf("\n<source>:%u:%u: error: %s\n",
+           error->row + 1, error->col,
+           error_messages[error->error_code]);
 }
 
 static void *alloc_gen_alloc(void *ctx, size_t size)
@@ -76,10 +75,71 @@ static void alloc_gen_free(void *ctx, void *ptr)
     free(ptr);
 }
 
+
+static int ZPP_define_macro(ZPP_State *state,
+                            ZPP_Error *error, 
+                            char *name, char *val)
+{
+    ZPP_Lexer lexer = {
+        .pos =
+        {
+            .ptr = val,
+        },
+    };
+
+    int ec;
+    if ((ec = ZPP_lexer_lex_direct(&lexer, error)) < 0)
+    {
+        return ec;
+    }
+
+    ZPP_Token *tokens = NULL;
+    if (ec != 0)
+    {
+        tokens = ZPP_gen_alloc(state, sizeof *tokens);
+        tokens[0] = lexer.result;
+    }
+    
+    ZPP_String text_str = {
+        .ptr = name,
+        .len = strlen(name),
+    };
+
+    ZPP_Ident *old_macro =
+        ZPP_ident_map_get(state, text_str);
+    
+    ZPP_Ident new_macro = {
+        .tokens = tokens,
+        .token_len = tokens != NULL,
+        .name = text_str.ptr,
+        .name_len = (uint32_t)text_str.len,
+        .is_macro = true,
+    };
+
+    if (old_macro != NULL)
+    {
+        new_macro.name = old_macro->name;
+        new_macro.hash = old_macro->hash;
+
+        ZPP_gen_free(state, old_macro->tokens);
+        *old_macro = new_macro;
+    }
+    else
+    {
+        ZPP_ident_map_set(state, &new_macro);
+    }
+
+    ZPP_gen_free(state, tokens);
+    return 1;
+}
+
 // TODO: make sure to add space when two tokens cannot paste e.g. | | != ||, a | == a|
 int main(int argc, char **argv)
 {
-    (void)argc;
+    int ec = 0;
+    ZPP_Error error = {0};
+
+    time_t start_time = time(NULL);
     ZPP_State state = {
         .allocator = &(ZPP_Allocator)
         {
@@ -90,7 +150,45 @@ int main(int argc, char **argv)
         },
     };
 
-    char *file_data = argc > 1 ? read_whole_file(argv[1]) : NULL;
+    if (ZPP_init_state(&state, NULL) < 0) return 1;
+
+    char *file_path = NULL;
+    bool print_time = false;
+    bool dump_macros = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (argv[i][0] == '-' && argv[i][1] == 'D')
+        {
+            char *macro_name = argv[i] + 2;
+            if (*macro_name == '\0') continue;
+            
+            char *macro_val = strstr(macro_name, "=");
+            if (macro_val == NULL) macro_val = "";
+            else macro_val[-1] = '\0';
+            
+            if (ZPP_define_macro(&state, &error, 
+                                 macro_name, macro_val) < 0)
+            {
+                goto error;
+            }  
+                                
+        }
+        else if (strcmp(argv[i], "--dump") == 0)
+        {
+            dump_macros = true;
+        }
+        else if (strcmp(argv[i], "--time") == 0)
+        {
+            print_time = true;
+        }
+        else
+        {
+            file_path = argv[i];
+        }
+    }
+    
+    if (file_path == NULL) return 0;
+    char *file_data = read_whole_file(file_path);
 
     if (file_data == NULL) return 1;
     if (ZPP_init_state(&state, file_data) <= 0) return 1;
@@ -98,19 +196,14 @@ int main(int argc, char **argv)
     size_t last_row = 0;    
     for(;;)
     {
-        ZPP_Error error = {0};
-        int error_result =
-            ZPP_read_token(&state, &error);
-
-        if (error_result == 0)
+        ec = ZPP_read_token(&state, &error);
+        if (ec == 0)
         {
             break;
         }
-        else if (error_result == -1)
+        else if (ec == -1)
         {
-            char buffer[1024] = {0};
-            ZPP_format_error(&error, buffer, sizeof buffer);
-            printf("\n%s\n", buffer);
+            goto error;
             break;
         }
 
@@ -137,65 +230,77 @@ int main(int argc, char **argv)
         
         fwrite(token.pos.ptr, 1, token.len, stdout);
     }
-
-#if 0
-    printf("\n\n---------------------\n"
-           "Macros defined:\n");
-    for (uint32_t i = 0; i < state.ident_map.cap; ++i)
+    
+    time_t end_time = time(NULL);
+    if (dump_macros)
     {
-        if (!state.ident_map.keys[i].is_alive ||
-            !state.ident_map.keys[i].is_macro)
+        printf("\n\n---------------------\n"
+               "Macros defined:\n");
+        for (uint32_t i = 0; i < state.ident_map.cap; ++i)
         {
-            continue;
-        }
+            if (!state.ident_map.keys[i].is_alive ||
+                !state.ident_map.keys[i].is_macro)
+            {
+                continue;
+            }
         
-        ZPP_Ident *macro = &state.ident_map.keys[i];
+            ZPP_Ident *macro = &state.ident_map.keys[i];
 
-        printf("#define %.*s",
-               (int)macro->name_len, macro->name);
+            printf("#define %.*s",
+                   (int)macro->name_len, macro->name);
 
-        if (macro->is_fn_macro)
-        {
-            printf("(");
-            for (uint32_t j = 0; j < macro->arg_len; ++j)
+            if (macro->is_fn_macro)
             {
-                printf("%.*s",
-                       (int)macro->args[j].len,
-                       macro->args[j].ptr);
-
-                if (j + 1 < macro->arg_len)
+                printf("(");
+                for (uint32_t j = 0; j < macro->arg_len; ++j)
                 {
-                    printf(", ");
+                    printf("%.*s",
+                           (int)macro->args[j].len,
+                           macro->args[j].ptr);
+
+                    if (j + 1 < macro->arg_len)
+                    {
+                        printf(", ");
+                    }
                 }
+                printf(")");
             }
-            printf(")");
-        }
 
-        printf(" ");
+            printf(" ");
             
-        for (uint32_t j = 0; j < macro->token_len; ++j)
-        {
-            ZPP_Token token = macro->tokens[j];
-            if((token.flags & ZPP_TOKEN_SPACE) != 0)
+            for (uint32_t j = 0; j < macro->token_len; ++j)
             {
-                fputc(' ', stdout);
+                ZPP_Token token = macro->tokens[j];
+                if((token.flags & ZPP_TOKEN_SPACE) != 0)
+                {
+                    fputc(' ', stdout);
+                }
+
+                if ((token.flags & ZPP_TOKEN_MACRO_ARG) != 0)
+                {
+                    ZPP_String arg = macro->args[token.len];
+                    token = (ZPP_Token) {
+                        .len = (uint32_t)arg.len,
+                        .pos.ptr = arg.ptr, 
+                    };
+                }
+
+                printf("%.*s", (int)token.len, token.pos.ptr);
             }
 
-            if ((token.flags & ZPP_TOKEN_MACRO_ARG) != 0)
-            {
-                ZPP_String arg = macro->args[token.len];
-                token = (ZPP_Token) {
-                    .len = (uint32_t)arg.len,
-                    .pos.ptr = arg.ptr, 
-                };
-            }
-
-            printf("%.*s", (int)token.len, token.pos.ptr);
+            printf("\n");
+            fflush(stdout);
         }
-
-        printf("\n");
-        fflush(stdout);
     }
-#endif
+    
+    if (print_time)
+    {
+        printf("\nIt took %g seconds.\n",
+               (double)(end_time - start_time) / CLOCKS_PER_SEC);
+    }
 
+    return 0;
+    
+error:
+    ZPP_print_error(&error);
 }
