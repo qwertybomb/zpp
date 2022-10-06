@@ -10,6 +10,7 @@
 #define ZPP_LINKAGE
 #endif
 
+// TODO: remove later headers not needed when testing is done
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -219,13 +220,22 @@ typedef struct
 
 typedef struct
 {
+    int32_t min_prec;
+    uint32_t pr_level;
+    char bk_type;
+} ZPP_IfData;
+
+typedef struct
+{
     ZPP_Token result;
+    ZPP_Token peek_tok;
     ZPP_IdentMap ident_map;
 
     ZPP_Allocator *allocator;
     ZPP_ContextBlock *context;
 
     ZPP_GenArray context_mem;
+    uint32_t pp_if_counter;
 }  ZPP_State;
 
 ZPP_LINKAGE int ZPP_init_state(ZPP_State *state, char *file_data);
@@ -963,6 +973,13 @@ static void ZPP_context_push(ZPP_State *state, ZPP_ContextBlock *item)
 static int ZPP_context_lex_direct(ZPP_State *state, ZPP_Error *error,
                                   ZPP_ContextBlock *old_context)
 {
+    if (state->peek_tok.pos.ptr != NULL)
+    {
+        state->result = state->peek_tok;
+        state->peek_tok = (ZPP_Token){0};
+        return 1;
+    }
+    
     if (state->context_mem.len == 0)
     {
         return 0;
@@ -1399,17 +1416,16 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
     if (ident->is_fn_macro)
     {
         // peek a token ahead for '(' and if not found just leave this token alone
-        ZPP_ContextBlock old_context;
         ZPP_Token old_result = state->result;
-        if ((ec = ZPP_context_lex_direct(state, error, &old_context)) < 0)
+        if ((ec = ZPP_context_lex_direct(state, error, NULL)) < 0)
         {
             return ec;
         }
         else if (ec == 0 ||
                  *state->result.pos.ptr != '(')
         {
+            if (ec != 0) state->peek_tok = state->result;
             state->result = old_result;
-            *state->context = old_context;
             return 1; 
         }
 
@@ -1782,9 +1798,21 @@ static bool ZPP_is_defined(ZPP_State *state, ZPP_Token *macro_tok)
     return ident->is_macro;
 }
 
-static int ZPP_handle_if_pp(ZPP_State *state, ZPP_Error *error, int64_t *result)
+static int ZPP_handle_if_pp(ZPP_State *state,
+                            ZPP_Error *error,
+                            int64_t *result,
+                            ZPP_IfData if_data)
 {
+    enum
+    {
+        MIN_PLEVEL,
+        SUM_PLEVEL,
+        MUL_PLEVEL,
+        MAX_PLEVEL
+    };
+    
     int ec;
+    int64_t x = -123456789;  
     ZPP_DIRECTIVE_IF_READ(state, error);
     if ((state->result.flags & ZPP_TOKEN_IDENT) != 0)
     {
@@ -1808,8 +1836,8 @@ static int ZPP_handle_if_pp(ZPP_State *state, ZPP_Error *error, int64_t *result)
                                                 ZPP_ERROR_UNEXPECTED_TOK);
                     }
                     
-                    *result = is_defined;
-                    return 1;
+                    x = is_defined;
+                    goto parsed_fac;
                 }
                 else if ((state->result.flags & ZPP_TOKEN_IDENT) == 0)
                 {
@@ -1820,14 +1848,13 @@ static int ZPP_handle_if_pp(ZPP_State *state, ZPP_Error *error, int64_t *result)
                 is_defined = ZPP_is_defined(state, &state->result);
                 if (!found_paren)
                 {
-                    *result = is_defined;
-                    return 1;
+                    x = is_defined;
+                    goto parsed_fac;
                 }
             }
         }
 
-        *result = 0;
-        return 1;
+        x = 0;
     }
     else if ((state->result.flags & ZPP_TOKEN_PPNUM) != 0)
     {
@@ -1838,11 +1865,146 @@ static int ZPP_handle_if_pp(ZPP_State *state, ZPP_Error *error, int64_t *result)
             val = val*10 + state->result.pos.ptr[i] - '0';
         }
 
-        *result = val;
+        x = val;
+    }
+    else if ((state->result.flags & ZPP_TOKEN_PUNCT))
+    {
+        if (state->result.type == '(')
+        {
+            if ((ec = ZPP_handle_if_pp(state, error, &x,
+                                       (ZPP_IfData){0, 1, ')'})) < 0)
+            {
+                return ec;
+            }
+
+            goto parsed_fac;
+        }
+
+        ZPP_Token op_tok = state->result;
+        for (int i = 0; i < 2; ++i)
+        {
+            switch(op_tok.type)
+            {
+                case '+': if (i != 0) { continue; } break;
+                case '-': if (i != 0) { x = -x; continue; } break;
+                case '!': if (i != 0) { x = !x; continue; } break;
+                case '~': if (i != 0) { x = ~x; continue; } break;
+                default:
+                {
+                    return ZPP_return_error(&op_tok.pos, error,
+                                            ZPP_ERROR_UNEXPECTED_TOK);
+                }   
+            }
+            
+            if ((ec = ZPP_handle_if_pp(state, error, &x,
+                                       (ZPP_IfData){
+                                           MAX_PLEVEL,
+                                           !!if_data.pr_level * 2,
+                                           if_data.bk_type,
+                                       })) < 0)
+            {
+                return ec;
+            }
+        }
+    }
+    else
+    {
+        // TODO: handle
+        __debugbreak();
+    }
+
+parsed_fac:;
+    if (if_data.min_prec == MAX_PLEVEL)
+    {
+        *result = x;
         return 1;
     }
     
-    return 1;
+    for(;;)
+    {
+        ZPP_Token old_tok = state->result;
+        if ((ec = ZPP_read_token(state, error)) < 0)
+        {
+            return ec;
+        }
+        else if (ec == 0)
+        {
+            if (if_data.pr_level > 0)
+            {
+                return ZPP_return_error(&old_tok.pos, error,
+                                        ZPP_ERROR_UNEXPECTED_EOL);
+            }
+            
+            *result = x;
+            return 1;
+        }
+        
+        int64_t y = -1234;
+        ZPP_Token op_tok = state->result;
+        if (op_tok.type == (uint32_t)if_data.bk_type)
+        {
+            if (if_data.pr_level > 0)
+            {
+                *result = x;
+                if (if_data.pr_level == 2)
+                {
+                    state->peek_tok = op_tok;
+                }
+                
+                return 1;
+            }
+            else
+            {
+                return ZPP_return_error(&op_tok.pos, error,
+                                        ZPP_ERROR_UNEXPECTED_TOK);
+            }
+        }
+
+        int min_op_prec = -1;
+        for (int i = 0; i < 2; ++i)
+        {
+            switch (op_tok.type)
+            {
+                case '+': if (i != 0) { x += y; continue; }
+                case '-': if (i != 0) { x -= y; continue; }
+                {
+                    min_op_prec = SUM_PLEVEL;
+                    break;
+                }
+                
+                case '*': if (i != 0) { x *= y; continue; }
+                case '/': if (i != 0) { x /= y; continue; }
+                case '%': if (i != 0) { x %= y; continue; }
+                {
+                    min_op_prec = MUL_PLEVEL;
+                    break;
+                }
+
+                default:
+                {
+                    return ZPP_return_error(&op_tok.pos, error,
+                                            ZPP_ERROR_UNEXPECTED_TOK);
+                }
+            }
+            
+            if (if_data.min_prec > min_op_prec)
+            {
+                state->peek_tok = op_tok;
+                *result = x;
+                return 1;
+            }
+            
+            if ((ec = ZPP_handle_if_pp(state, error, &y,
+                                       (ZPP_IfData){
+                                           min_op_prec + 1,
+                                           !!if_data.pr_level * 2,
+                                           if_data.bk_type
+                                       })) < 0)
+            {
+                return ec;
+            }
+        }
+    }
 }
 
 ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error)
@@ -1871,7 +2033,7 @@ read_token:;
     
     // NOTE: only a file lexer should be able to return a BOL token
     // meaning that we can directly cast our context to a ZPP_Lexer
-    ZPP_Lexer *lexer = (ZPP_Lexer*)state->context;
+    ZPP_Lexer *lexer = &state->context->lexer;
     ZPP_Lexer old_lex = *lexer;
     
     lexer->flags |= ZPP_LEXER_PP;
@@ -2114,6 +2276,7 @@ read_token:;
                                     ZPP_ERROR_UNEXPECTED_TOK);
         }
 
+        state->pp_if_counter = 0;
         ZPP_lexer_bpush(lexer, ZPP_is_defined(state, &lexer->result));
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
@@ -2128,6 +2291,7 @@ read_token:;
                                     ZPP_ERROR_UNEXPECTED_TOK);
         }
 
+        state->pp_if_counter = 1;
         ZPP_lexer_bpush(lexer, !ZPP_is_defined(state, &lexer->result));
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
@@ -2138,12 +2302,14 @@ read_token:;
         state->context->base.flags |= ZPP_CONTEXT_LOCK;
 
         int64_t value; 
-        if ((ec = ZPP_handle_if_pp(state, error, &value)) < 0)
+        if ((ec = ZPP_handle_if_pp(state, error, &value, (ZPP_IfData){0})) < 0)
         {
             return ec;
         }
-
-        //state->context->base.flags &= ~(uint32_t)ZPP_CONTEXT_LOCK;
+        lexer = &state->context->lexer;
+        
+        state->pp_if_counter = 1;
+        state->context->base.flags &= ~(uint32_t)ZPP_CONTEXT_LOCK;
         ZPP_lexer_bpush(lexer, value != 0);
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
@@ -2157,7 +2323,20 @@ read_token:;
 pp_level0:;
     if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "endif"))
     {
-        ZPP_lexer_bpop(lexer);
+        --state->pp_if_counter;
+        if (state->pp_if_counter == 0)
+        {
+            ZPP_lexer_bpop(lexer);
+        }
+
+        lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
+        goto read_token;
+    }
+    else if (blevel == 0 &&
+             (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "if") ||
+              ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "ifdef")))
+    {
+        ++state->pp_if_counter;
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
