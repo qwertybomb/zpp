@@ -10,7 +10,7 @@
 #define ZPP_LINKAGE
 #endif
 
-// TODO: remove later headers not needed when testing is done
+// TODO: remove any headers that are only needed for tested when this is done
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -222,7 +222,6 @@ typedef struct
 {
     int32_t min_prec;
     uint32_t pr_level;
-    char bk_type;
 } ZPP_IfData;
 
 typedef struct
@@ -233,9 +232,10 @@ typedef struct
 
     ZPP_Allocator *allocator;
     ZPP_ContextBlock *context;
-
     ZPP_GenArray context_mem;
+    
     uint32_t pp_if_counter;
+    uint32_t pp_if_gr_type;
 }  ZPP_State;
 
 ZPP_LINKAGE int ZPP_init_state(ZPP_State *state, char *file_data);
@@ -898,8 +898,11 @@ comment_done:
                         ++lexer->pos.ptr;
                         ++lexer->pos.col;
                     } while (ZPP_is_digit(*lexer->pos.ptr) ||
-                             ZPP_is_ident_char(*lexer->pos.ptr));
-
+                             ZPP_is_ident_char(*lexer->pos.ptr) ||
+                             ((*lexer->pos.ptr == '+' || *lexer->pos.ptr == '-') &&
+                              (*lexer->pos.ptr == 'E' || *lexer->pos.ptr == 'e' ||
+                               *lexer->pos.ptr == 'P' || *lexer->pos.ptr == 'p')));
+                             
                     return 1;
                 }
 
@@ -1798,21 +1801,24 @@ static bool ZPP_is_defined(ZPP_State *state, ZPP_Token *macro_tok)
     return ident->is_macro;
 }
 
+// TODO: handle sign, char literals, more number literals, more Ops, and short circut. 
 static int ZPP_handle_if_pp(ZPP_State *state,
                             ZPP_Error *error,
-                            int64_t *result,
+                            intmax_t *result,
                             ZPP_IfData if_data)
 {
     enum
     {
-        MIN_PLEVEL,
-        SUM_PLEVEL,
-        MUL_PLEVEL,
-        MAX_PLEVEL
+        PLEVEL_MIN,
+        PLEVEL_CMP,
+        PLEVEL_SHF,   
+        PLEVEL_SUM,
+        PLEVEL_MUL,
+        PLEVEL_MAX,
     };
     
     int ec;
-    int64_t x = -123456789;  
+    intmax_t x = -123456789;  
     ZPP_DIRECTIVE_IF_READ(state, error);
     if ((state->result.flags & ZPP_TOKEN_IDENT) != 0)
     {
@@ -1859,7 +1865,7 @@ static int ZPP_handle_if_pp(ZPP_State *state,
     else if ((state->result.flags & ZPP_TOKEN_PPNUM) != 0)
     {
         // TODO: handle hex numbers and maybe floating point
-        int64_t val = 0;
+        intmax_t val = 0;
         for (uint32_t i = 0; i < state->result.len; ++i)
         {
             val = val*10 + state->result.pos.ptr[i] - '0';
@@ -1869,22 +1875,25 @@ static int ZPP_handle_if_pp(ZPP_State *state,
     }
     else if ((state->result.flags & ZPP_TOKEN_PUNCT))
     {
-        if (state->result.type == '(')
-        {
-            if ((ec = ZPP_handle_if_pp(state, error, &x,
-                                       (ZPP_IfData){0, 1, ')'})) < 0)
-            {
-                return ec;
-            }
-
-            goto parsed_fac;
-        }
-
         ZPP_Token op_tok = state->result;
         for (int i = 0; i < 2; ++i)
         {
             switch(op_tok.type)
             {
+                case '(':
+                {
+                    uint32_t old_gr_type = state->pp_if_gr_type;
+                    state->pp_if_gr_type = ')';
+                    if ((ec = ZPP_handle_if_pp(state, error, &x,
+                                               (ZPP_IfData){0, 1})) < 0)
+                    {
+                        return ec;
+                    }
+                    state->pp_if_gr_type = old_gr_type;
+            
+                    goto parsed_fac;
+                }
+                
                 case '+': if (i != 0) { continue; } break;
                 case '-': if (i != 0) { x = -x; continue; } break;
                 case '!': if (i != 0) { x = !x; continue; } break;
@@ -1898,9 +1907,8 @@ static int ZPP_handle_if_pp(ZPP_State *state,
             
             if ((ec = ZPP_handle_if_pp(state, error, &x,
                                        (ZPP_IfData){
-                                           MAX_PLEVEL,
+                                           PLEVEL_MAX,
                                            !!if_data.pr_level * 2,
-                                           if_data.bk_type,
                                        })) < 0)
             {
                 return ec;
@@ -1914,7 +1922,7 @@ static int ZPP_handle_if_pp(ZPP_State *state,
     }
 
 parsed_fac:;
-    if (if_data.min_prec == MAX_PLEVEL)
+    if (if_data.min_prec == PLEVEL_MAX)
     {
         *result = x;
         return 1;
@@ -1939,9 +1947,9 @@ parsed_fac:;
             return 1;
         }
         
-        int64_t y = -1234;
+        intmax_t y = -1234;
         ZPP_Token op_tok = state->result;
-        if (op_tok.type == (uint32_t)if_data.bk_type)
+        if (op_tok.type == state->pp_if_gr_type)
         {
             if (if_data.pr_level > 0)
             {
@@ -1965,10 +1973,17 @@ parsed_fac:;
         {
             switch (op_tok.type)
             {
+                case ZPP_TYPE_SHIFTL: if (i != 0) { x <<= y; continue; }
+                case ZPP_TYPE_SHIFTR: if (i != 0) { x >>= y; continue; }
+                {
+                    min_op_prec = PLEVEL_SHF;
+                    break;
+                }
+                
                 case '+': if (i != 0) { x += y; continue; }
                 case '-': if (i != 0) { x -= y; continue; }
                 {
-                    min_op_prec = SUM_PLEVEL;
+                    min_op_prec = PLEVEL_SUM;
                     break;
                 }
                 
@@ -1976,7 +1991,7 @@ parsed_fac:;
                 case '/': if (i != 0) { x /= y; continue; }
                 case '%': if (i != 0) { x %= y; continue; }
                 {
-                    min_op_prec = MUL_PLEVEL;
+                    min_op_prec = PLEVEL_MUL;
                     break;
                 }
 
@@ -1998,7 +2013,6 @@ parsed_fac:;
                                        (ZPP_IfData){
                                            min_op_prec + 1,
                                            !!if_data.pr_level * 2,
-                                           if_data.bk_type
                                        })) < 0)
             {
                 return ec;
@@ -2301,7 +2315,7 @@ read_token:;
         // make it so that macros can't escape this line
         state->context->base.flags |= ZPP_CONTEXT_LOCK;
 
-        int64_t value; 
+        intmax_t value; 
         if ((ec = ZPP_handle_if_pp(state, error, &value, (ZPP_IfData){0})) < 0)
         {
             return ec;
