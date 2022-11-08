@@ -136,6 +136,8 @@ typedef struct
 typedef struct
 {
     uint32_t flags;
+    uint16_t cur_len;
+    uint16_t prev_len;
 } ZPP_Context;
 
 typedef struct
@@ -226,6 +228,12 @@ typedef struct
 
 typedef struct
 {
+    int64_t val;
+    bool sign;
+} ZPP_PPNum;
+
+typedef struct
+{
     ZPP_Token result;
     ZPP_Token peek_tok;
     ZPP_IdentMap ident_map;
@@ -251,14 +259,14 @@ ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error);
 #define ZPP_LEXER_TRY_READ(s_, e_)                           \
     do                                                       \
     {                                                        \
-        ec = ZPP_context_lex_direct(s_, e_, NULL);           \
+        ec = ZPP_context_lex_direct(s_, e_);                 \
         if (ec <= 0) return ec;                              \
     } while(false)
 
 #define ZPP_LEXER_TRY_READ_FULL(s_, e_)                             \
     do                                                              \
     {                                                               \
-        ec = ZPP_context_lex_direct(s_, e_, NULL);                  \
+        ec = ZPP_context_lex_direct(s_, e_);                        \
         if (ec < 0) return ec;                                      \
         if (ec == 0)                                                \
         {                                                           \
@@ -337,7 +345,7 @@ static int ZPP_lexer_btop(ZPP_ContextBlock *context)
     if (lexer->bstack_len == 0) return -1;
     
     uint32_t bit_index = lexer->bstack_len - 1;
-    return (lexer->bstack[bit_index / 32] >> bit_index % 32) & 0x1;
+    return (lexer->bstack[bit_index/32] >> bit_index % 32) & 0x1;
 }
 
 static void ZPP_lexer_bpop(ZPP_Lexer *lexer)
@@ -348,10 +356,15 @@ static void ZPP_lexer_bpop(ZPP_Lexer *lexer)
 static void ZPP_lexer_bpush(ZPP_Lexer *lexer, bool bit)
 {
     uint32_t bit_index = lexer->bstack_len++;
-    lexer->bstack[bit_index / 32] &= ~((uint32_t)0x1 << bit_index % 32);
-    lexer->bstack[bit_index / 32] |= (uint32_t)bit << bit_index % 32;
+    lexer->bstack[bit_index/32] &= ~((uint32_t)0x1 << bit_index%32);
+    lexer->bstack[bit_index/32] |= (uint32_t)bit << bit_index%32;
 }
 
+static void ZPP_lexer_bflip(ZPP_Lexer *lexer)
+{
+    uint32_t bit_index = lexer->bstack_len - 1;
+    lexer->bstack[bit_index/32] ^= (uint32_t)0x1 << bit_index%32;
+}
 
 // NOTE: before using this remember to save the old location
 static char ZPP_lexer_read_char(ZPP_Lexer *lexer)
@@ -837,31 +850,25 @@ star_case:
                     char cur = ZPP_lexer_read_char(lexer);
                     for(;;)
                     {
-                        switch(cur)
+                        if (cur == '*')
                         {
-                            case '*':
-                            {
-                                cur = ZPP_lexer_read_char(lexer);
-                                if (cur == '/') goto comment_done;
-                                continue; 
-                            }
-                            
-                            case '\n':
-                            {
-                                ++lexer->pos.row;
-                                lexer->pos.col = 0;
-                                break;
-                            }
-
-                            case '\0':
-                            {
-                                goto eof_found;
-                            }
+                            cur = ZPP_lexer_read_char(lexer);
+                            if (cur == '/') break;
+                            continue;
                         }
-
+                        else if (cur == '\n')
+                        {
+                            ++lexer->pos.row;
+                            lexer->pos.col = 0;
+                        }
+                        else if (cur == '\0')
+                        {
+                            goto eof_found;
+                        }
+                        
                         cur = ZPP_lexer_read_char(lexer);
                     }
-comment_done:
+                    
                     continue;
                 }
                 else if (ch == '=')
@@ -944,12 +951,15 @@ static int ZPP_context_pop(ZPP_State *state)
     }
 
     if (state->context_mem.len == 0 ||
-        --state->context_mem.len == 0)
+        (state->context_mem.len -=
+         state->context->base.cur_len) == 0)
     {
         return 0;
     }
     
-    state->context = &state->context_mem.u.ctx[state->context_mem.len - 1];
+    state->context =
+        (ZPP_ContextBlock*)((char*)state->context -
+                            state->context->base.prev_len);
     return 1;
 }
 
@@ -959,8 +969,9 @@ static void ZPP_gen_array_grow_impl(ZPP_State *state,
 {
     if (array->len + grow > array->cap)
     {
-        array->cap = (array->len + grow) * 3 / 2;
-        array->u.ptr = ZPP_gen_realloc(state, array->u.ptr, array->cap * type);
+        array->cap = (array->len + grow)*3/2;
+        array->u.ptr =
+            ZPP_gen_realloc(state, array->u.ptr, array->cap * type);
     }
 
     array->len += grow;
@@ -968,13 +979,23 @@ static void ZPP_gen_array_grow_impl(ZPP_State *state,
 
 static void ZPP_context_push(ZPP_State *state, ZPP_ContextBlock *item)
 {
-    ZPP_GEN_ARRAY_GROW(state, &state->context_mem, ZPP_ContextBlock, 1); 
-    state->context = &state->context_mem.u.ctx[state->context_mem.len - 1];
-    *state->context = *item;
+    uint16_t prev_len =
+        state->context_mem.len != 0 ?
+        state->context->base.cur_len : 0;
+    
+    ZPP_GEN_ARRAY_GROW(state, &state->context_mem,
+                       char, item->base.cur_len);
+    
+    state->context =
+        (ZPP_ContextBlock*)
+        (state->context_mem.u.ptr +
+         state->context_mem.len - item->base.cur_len);
+    
+    ZPP_memcpy(state->context, item, item->base.cur_len);
+    state->context->base.prev_len = prev_len;
 }
 
-static int ZPP_context_lex_direct(ZPP_State *state, ZPP_Error *error,
-                                  ZPP_ContextBlock *old_context)
+static int ZPP_context_lex_direct(ZPP_State *state, ZPP_Error *error)
 {
     if (state->peek_tok.pos.ptr != NULL)
     {
@@ -989,12 +1010,7 @@ static int ZPP_context_lex_direct(ZPP_State *state, ZPP_Error *error,
     }
     
     for(;;)
-    {
-        if (old_context != NULL)
-        {
-            *old_context = *state->context;
-        }
-        
+    {   
         switch (state->context->base.flags & ZPP_CONTEXT_TYPES)
         {
             case ZPP_CONTEXT_FILE:
@@ -1051,6 +1067,14 @@ static int ZPP_context_lex_direct(ZPP_State *state, ZPP_Error *error,
     }
 }
 
+static ZPP_String ZPP_tok_to_str(ZPP_Token *token)
+{
+    return (ZPP_String) {
+        .len = token->len,
+        .ptr = token->pos.ptr,
+    };
+}
+
 static bool ZPP_string_cmp(ZPP_String a, ZPP_String b)
 {
     if (a.len != b.len) return false;
@@ -1072,6 +1096,11 @@ static bool ZPP_string_cmp2(ZPP_String str, char const *lit)
     }
 
     return *lit == '\0';
+}
+
+static bool ZPP_string_cmp3(ZPP_Token *tok, char const *lit)
+{
+    return ZPP_string_cmp2(ZPP_tok_to_str(tok), lit);
 }
 
 static uint32_t ZPP_string_hash(char *ptr, uint32_t len)
@@ -1107,7 +1136,7 @@ static ZPP_Ident *ZPP_ident_map_get(ZPP_State *state, ZPP_String name)
 
 static void ZPP_ident_map_set(ZPP_State *state, ZPP_Ident *macro)
 {
-    if ((state->ident_map.len + 1) * 4 / 3 > state->ident_map.cap)
+    if ((state->ident_map.len + 1)*4/3 > state->ident_map.cap)
     {
         uint32_t new_cap = state->ident_map.cap * 2;
         ZPP_Ident *new_keys =
@@ -1158,14 +1187,6 @@ static void ZPP_ident_map_set(ZPP_State *state, ZPP_Ident *macro)
     }
 }
 
-static ZPP_String ZPP_tok_to_str(ZPP_Token *token)
-{
-    return (ZPP_String) {
-        .len = token->len,
-        .ptr = token->pos.ptr,
-    };
-}
-
 ZPP_LINKAGE int ZPP_init_state(ZPP_State *state, char *file_data)
 {
     if (state->ident_map.keys == NULL)
@@ -1180,12 +1201,14 @@ ZPP_LINKAGE int ZPP_init_state(ZPP_State *state, char *file_data)
 
     if (file_data != NULL)
     {
-        ZPP_context_push(state, &(ZPP_ContextBlock)
+        ZPP_context_push(state,
+                         &(ZPP_ContextBlock)
                          {
                              .lexer = {
                                  .pos.ptr = file_data,
                                  .flags = ZPP_LEXER_BOL,
                                  .base.flags = ZPP_CONTEXT_FILE,
+                                 .base.cur_len = sizeof(ZPP_Lexer),
                              }
                          });
     }
@@ -1302,6 +1325,8 @@ static int ZPP_expand_macro_arg(ZPP_State *state,
                          .macro_context = {
                              .base.flags =
                              ZPP_CONTEXT_MACRO | ZPP_CONTEXT_LOCK,
+                             .base.cur_len =
+                             sizeof(ZPP_MacroContext),
                              .macro = NULL,
                              .tokens = current_arg.ptr,
                              .token_len = (uint32_t)current_arg.len,
@@ -1313,7 +1338,7 @@ static int ZPP_expand_macro_arg(ZPP_State *state,
     for(;;)
     {
         int ec;
-        if ((ec = ZPP_context_lex_direct(state, error, NULL)) < 0)
+        if ((ec = ZPP_context_lex_direct(state, error)) < 0)
         {
             return ec;
         }
@@ -1343,7 +1368,7 @@ static int ZPP_expand_macro_arg(ZPP_State *state,
 
         if (++new_tok_arr.len > new_tok_arr.cap)
         {
-            new_tok_arr.cap = (new_tok_arr.cap + 1) * 3 / 2;
+            new_tok_arr.cap = (new_tok_arr.cap + 1)*3/2;
             new_tok_arr.ptr = ZPP_gen_realloc(state,
                                               new_tok_arr.ptr,
                                               new_tok_arr.cap *
@@ -1357,7 +1382,8 @@ static int ZPP_expand_macro_arg(ZPP_State *state,
     *macro_arg = new_tok_arr;
     
     // remove current locked context
-    state->context = &state->context_mem.u.ctx[--state->context_mem.len - 1];
+    state->context->base.flags &= ~(uint32_t)ZPP_CONTEXT_LOCK;
+    ZPP_context_pop(state);
     return 1;
 }
 
@@ -1420,7 +1446,7 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
     {
         // peek a token ahead for '(' and if not found just leave this token alone
         ZPP_Token old_result = state->result;
-        if ((ec = ZPP_context_lex_direct(state, error, NULL)) < 0)
+        if ((ec = ZPP_context_lex_direct(state, error)) < 0)
         {
             return ec;
         }
@@ -1515,7 +1541,7 @@ push_token:;
             ZPP_TokenArray *current = &macro_args.u.tok_arr[macro_args.len - 1];
             if (++current->len > token_args_cap)
             {
-                token_args_cap = (token_args_cap + 1) * 3 / 2;
+                token_args_cap = (token_args_cap + 1)*3/2;
                 current->ptr = ZPP_gen_realloc(state,
                                                current->ptr,
                                                token_args_cap *
@@ -1559,11 +1585,11 @@ push_token:;
             
             ZPP_TokenArray copy = {
                 .ptr = ZPP_gen_alloc(state,
-                                     src.len * sizeof *src.ptr),
+                                     src.len*sizeof *src.ptr),
                 .len = src.len,
             };
 
-            ZPP_memcpy(copy.ptr, src.ptr, src.len * sizeof *src.ptr);
+            ZPP_memcpy(copy.ptr, src.ptr, src.len*sizeof *src.ptr);
             expand_macro_args.u.tok_arr[i] = copy;
 
             // fix unexpanded macros
@@ -1646,7 +1672,7 @@ push_token:;
 
                 ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, arg->len);
                 ZPP_memcpy(tokens.u.tok + tokens.len - arg->len,
-                           arg->ptr, arg->len * sizeof *tokens.u.tok);
+                           arg->ptr, arg->len*sizeof *tokens.u.tok);
             }
             else
             {
@@ -1704,7 +1730,7 @@ was_stringize:;
                     ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, arg.len - arg_skip);
                     ZPP_memcpy(tokens.u.tok + tokens.len -
                                arg.len + arg_skip, arg.ptr + arg_skip,
-                               (arg.len - arg_skip) * sizeof *tokens.u.tok);
+                               (arg.len - arg_skip)*sizeof *tokens.u.tok);
                 }
                 else
                 {
@@ -1765,11 +1791,12 @@ was_stringize:;
                          &(ZPP_ContextBlock)
                          {
                              .macro_context = {
-                                 .base.flags = ZPP_CONTEXT_MACRO,
                                  .macro = ident,
                                  .tokens = tokens.u.tok,
                                  .token_len = (uint32_t)tokens.len,
                                  .token_total = (uint32_t)tokens.len,
+                                 .base.flags = ZPP_CONTEXT_MACRO,
+                                 .base.cur_len = sizeof(ZPP_MacroContext),
                              }
                          });
 
@@ -1804,7 +1831,7 @@ static bool ZPP_is_defined(ZPP_State *state, ZPP_Token *macro_tok)
 // TODO: handle sign, char literals, more number literals, more Ops, and short circut. 
 static int ZPP_handle_if_pp(ZPP_State *state,
                             ZPP_Error *error,
-                            intmax_t *result,
+                            ZPP_PPNum *result,
                             ZPP_IfData if_data)
 {
     enum
@@ -1818,11 +1845,11 @@ static int ZPP_handle_if_pp(ZPP_State *state,
     };
     
     int ec;
-    intmax_t x = -123456789;  
+    ZPP_PPNum x = {-123456789};  
     ZPP_DIRECTIVE_IF_READ(state, error);
     if ((state->result.flags & ZPP_TOKEN_IDENT) != 0)
     {
-        if (ZPP_string_cmp2(ZPP_tok_to_str(&state->result), "defined"))
+        if (ZPP_string_cmp3(&state->result, "defined"))
         {
             int is_defined = -1;
             bool found_paren = false;
@@ -1842,7 +1869,7 @@ static int ZPP_handle_if_pp(ZPP_State *state,
                                                 ZPP_ERROR_UNEXPECTED_TOK);
                     }
                     
-                    x = is_defined;
+                    x.val = is_defined;
                     goto parsed_fac;
                 }
                 else if ((state->result.flags & ZPP_TOKEN_IDENT) == 0)
@@ -1854,21 +1881,55 @@ static int ZPP_handle_if_pp(ZPP_State *state,
                 is_defined = ZPP_is_defined(state, &state->result);
                 if (!found_paren)
                 {
-                    x = is_defined;
+                    x.val = is_defined;
                     goto parsed_fac;
                 }
             }
         }
 
-        x = 0;
+        x.val = 0;
     }
     else if ((state->result.flags & ZPP_TOKEN_PPNUM) != 0)
     {
-        // TODO: handle hex numbers and maybe floating point
-        intmax_t val = 0;
-        for (uint32_t i = 0; i < state->result.len; ++i)
+        uint32_t i = 0;
+        ZPP_PPNum val = {0};
+        if (state->result.pos.ptr[0] == '0')
         {
-            val = val*10 + state->result.pos.ptr[i] - '0';
+            if (state->result.len > 2 &&
+                (state->result.pos.ptr[1] == 'x' ||
+                 state->result.pos.ptr[1] == 'X'))
+            {
+                for (i = 2; i < state->result.len; ++i)
+                {   
+                    char c = state->result.pos.ptr[i];
+                    if (c >= '0' && c <= '9')
+                    {
+                        val.val = val.val*16 + c - '0';
+                    }
+                    else if (c >= 'a' && c <= 'f')
+                    {
+                        val.val = val.val*16 + c - 'a' + 10;
+                    }
+                    else if (c >= 'A' && c <= 'F')
+                    {
+                        val.val = val.val*16 + c - 'A' + 10;
+                    }
+                }
+            }
+            else
+            {
+                for (i = 1; i < state->result.len; ++i)
+                {
+                    val.val = val.val*8 + state->result.pos.ptr[i] - '0';
+                }
+            }
+        }
+        else
+        {
+            for (i = 0; i < state->result.len; ++i)
+            {
+                val.val = val.val*10 + state->result.pos.ptr[i] - '0';
+            }
         }
 
         x = val;
@@ -1895,9 +1956,9 @@ static int ZPP_handle_if_pp(ZPP_State *state,
                 }
                 
                 case '+': if (i != 0) { continue; } break;
-                case '-': if (i != 0) { x = -x; continue; } break;
-                case '!': if (i != 0) { x = !x; continue; } break;
-                case '~': if (i != 0) { x = ~x; continue; } break;
+                case '-': if (i != 0) { x.val = -x.val; continue; } break;
+                case '!': if (i != 0) { x.val = !x.val; continue; } break;
+                case '~': if (i != 0) { x.val = ~x.val; continue; } break;
                 default:
                 {
                     return ZPP_return_error(&op_tok.pos, error,
@@ -1908,7 +1969,7 @@ static int ZPP_handle_if_pp(ZPP_State *state,
             if ((ec = ZPP_handle_if_pp(state, error, &x,
                                        (ZPP_IfData){
                                            PLEVEL_MAX,
-                                           !!if_data.pr_level * 2,
+                                           !!if_data.pr_level*2,
                                        })) < 0)
             {
                 return ec;
@@ -1947,7 +2008,7 @@ parsed_fac:;
             return 1;
         }
         
-        intmax_t y = -1234;
+        ZPP_PPNum y = {-1234};
         ZPP_Token op_tok = state->result;
         if (op_tok.type == state->pp_if_gr_type)
         {
@@ -1973,28 +2034,79 @@ parsed_fac:;
         {
             switch (op_tok.type)
             {
-                case ZPP_TYPE_SHIFTL: if (i != 0) { x <<= y; continue; }
-                case ZPP_TYPE_SHIFTR: if (i != 0) { x >>= y; continue; }
+                case ZPP_TYPE_SHIFTL:
                 {
+                    if (i != 0)
+                    {
+                        x.val =
+                            x.sign                              ?
+                            (int64_t)((uint64_t)x.val << y.val) :
+                            x.val << y.val;
+                        
+                        continue;
+                    }
+                }
+                
+                case ZPP_TYPE_SHIFTR:
+                {
+                    if (i != 0)
+                    {
+                        x.val =
+                            x.sign                              ?
+                            (int64_t)((uint64_t)x.val >> y.val) :
+                            x.val >> y.val;
+                        
+                        continue;
+                    }
+                       
                     min_op_prec = PLEVEL_SHF;
                     break;
                 }
                 
-                case '+': if (i != 0) { x += y; continue; }
-                case '-': if (i != 0) { x -= y; continue; }
+                case '+': if (i != 0) { x.val += y.val; continue; }
+                case '-': if (i != 0) { x.val -= y.val; continue; }
                 {
                     min_op_prec = PLEVEL_SUM;
                     break;
                 }
                 
-                case '*': if (i != 0) { x *= y; continue; }
-                case '/': if (i != 0) { x /= y; continue; }
-                case '%': if (i != 0) { x %= y; continue; }
+                case '*': if (i != 0) { x.val *= y.val; continue; }
+                case '/': if (i != 0) { x.val /= y.val; continue; }
+                case '%': if (i != 0) { x.val %= y.val; continue; }
                 {
                     min_op_prec = PLEVEL_MUL;
                     break;
                 }
 
+#define SIGN_CMP(c)                                                     \
+                if (true)                                               \
+                {                                                       \
+                    x.val = !x.sign ?                                   \
+                        (uint64_t)x.val c (uint64_t)y.val :             \
+                        x.val c y.val;                                  \
+                    continue;                                           \
+                } else
+                
+                case '<': if (i != 0) { SIGN_CMP(<); }
+                case '>': if (i != 0) { SIGN_CMP(>); }
+                case ZPP_TYPE_GTQ: if (i != 0) { SIGN_CMP(>=); }
+                case ZPP_TYPE_LTQ: if (i != 0) { SIGN_CMP(<=); }
+                case ZPP_TYPE_EQQ:
+                case ZPP_TYPE_NOTQ:
+                {
+                    if (i != 0)
+                    {
+                        x.val =
+                            op_tok.type == ZPP_TYPE_NOTQ ?
+                            x.val != y.val : x.val == y.val;
+                        
+                        continue;
+                    }
+
+                    min_op_prec = PLEVEL_CMP;
+                    break;
+                }
+#undef SIGN_CMP
                 default:
                 {
                     return ZPP_return_error(&op_tok.pos, error,
@@ -2012,7 +2124,7 @@ parsed_fac:;
             if ((ec = ZPP_handle_if_pp(state, error, &y,
                                        (ZPP_IfData){
                                            min_op_prec + 1,
-                                           !!if_data.pr_level * 2,
+                                           !!if_data.pr_level*2,
                                        })) < 0)
             {
                 return ec;
@@ -2028,7 +2140,7 @@ read_token:;
     ZPP_LEXER_TRY_READ(state, error);
 
     int blevel =
-        ZPP_lexer_btop(&state->context_mem.u.ctx[state->context_mem.len - 1]);
+        ZPP_lexer_btop(state->context);
     
     if (state->result.pos.ptr[0] != '#' ||
         (state->result.flags & ZPP_TOKEN_BOL) == 0)
@@ -2076,7 +2188,7 @@ read_token:;
     } while (false)
 
     if (blevel == 0) goto pp_level0;
-    if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "define"))
+    if (ZPP_string_cmp3(&lexer->result, "define"))
     {
         ZPP_DIRECTIVE_TRY_READ(lexer, error);
 
@@ -2247,7 +2359,7 @@ read_token:;
             }
         }
     }
-    else if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "undef"))
+    else if (ZPP_string_cmp3(&lexer->result, "undef"))
     {
         ZPP_DIRECTIVE_TRY_READ(lexer, error);
         
@@ -2280,7 +2392,7 @@ read_token:;
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
-    else if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "ifdef"))
+    else if (ZPP_string_cmp3(&lexer->result, "ifdef"))
     {
         ZPP_DIRECTIVE_TRY_READ(lexer, error);
         
@@ -2295,7 +2407,7 @@ read_token:;
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
-    else if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "ifndef"))
+    else if (ZPP_string_cmp3(&lexer->result, "ifndef"))
     {
         ZPP_DIRECTIVE_TRY_READ(lexer, error);
         
@@ -2310,13 +2422,14 @@ read_token:;
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
-    else if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "if"))
+    else if (ZPP_string_cmp3(&lexer->result, "if"))
     {
         // make it so that macros can't escape this line
         state->context->base.flags |= ZPP_CONTEXT_LOCK;
 
-        intmax_t value; 
-        if ((ec = ZPP_handle_if_pp(state, error, &value, (ZPP_IfData){0})) < 0)
+        ZPP_PPNum value; 
+        if ((ec = ZPP_handle_if_pp(state, error,
+                                   &value, (ZPP_IfData){0})) < 0)
         {
             return ec;
         }
@@ -2324,7 +2437,7 @@ read_token:;
         
         state->pp_if_counter = 1;
         state->context->base.flags &= ~(uint32_t)ZPP_CONTEXT_LOCK;
-        ZPP_lexer_bpush(lexer, value != 0);
+        ZPP_lexer_bpush(lexer, value.val != 0);
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
@@ -2335,26 +2448,24 @@ read_token:;
     }
 
 pp_level0:;
-    if (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "endif"))
+    if (ZPP_string_cmp3(&lexer->result, "endif"))
     {
-        --state->pp_if_counter;
-        if (state->pp_if_counter == 0)
+        ZPP_lexer_bpop(lexer);
+        lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
+        goto read_token;
+    }
+    else if (blevel == 0)
+    {
+        if ((ZPP_string_cmp3(&lexer->result, "if") ||
+             ZPP_string_cmp3(&lexer->result, "ifdef")))
         {
-            ZPP_lexer_bpop(lexer);
+            ++state->pp_if_counter;
         }
-
+        
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
-    else if (blevel == 0 &&
-             (ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "if") ||
-              ZPP_string_cmp2(ZPP_tok_to_str(&lexer->result), "ifdef")))
-    {
-        ++state->pp_if_counter;
-        lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
-        goto read_token;
-    }
-    
+        
     *lexer = old_lex;
     return 1;
    
