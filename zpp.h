@@ -143,12 +143,13 @@ typedef struct
 typedef struct
 {
     ZPP_Context base;
-    uint32_t flags : 3;
-    uint32_t bstack_len : 29;
     
     ZPP_Pos pos;
     ZPP_Token result;
-    uint32_t bstack[4];
+    
+    uint32_t bstack[8];
+    uint32_t flags : 3;
+    uint32_t bstack_len : 29;
 } ZPP_Lexer;
 
 typedef struct 
@@ -289,7 +290,8 @@ ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error);
 
 
 #define ZPP_STR_STATIC(str_) ((ZPP_String){.ptr=(str_), .len=sizeof((str_)) - 1})
-#define ZPP_GEN_ARRAY_GROW(s_, a_, t_, g_) ZPP_gen_array_grow_impl(s_, a_, sizeof(t_), g_)
+#define ZPP_GEN_ARRAY_GROW(a_, t_, g_)              \
+    ZPP_gen_array_grow_impl(state, a_, sizeof(t_), g_)
 
 static void *ZPP_memcpy(void *dest, void const *src, size_t size)
 {
@@ -337,6 +339,12 @@ static int ZPP_return_error(ZPP_Pos *pos,
 }
 
 // NOTE: assumes uint32_t is 4 bytes
+static bool ZPP_lexer_bget(ZPP_Lexer *lexer,
+                           uint32_t bit_index)
+{    
+    return ((lexer->bstack[bit_index/32] >> bit_index % 32) & 0x1) != 0;
+}
+
 static int ZPP_lexer_btop(ZPP_ContextBlock *context)
 {
     if ((context->base.flags & ZPP_CONTEXT_FILE) == 0) return -1;
@@ -344,8 +352,7 @@ static int ZPP_lexer_btop(ZPP_ContextBlock *context)
     ZPP_Lexer *lexer = &context->lexer;
     if (lexer->bstack_len == 0) return -1;
     
-    uint32_t bit_index = lexer->bstack_len - 1;
-    return (lexer->bstack[bit_index/32] >> bit_index % 32) & 0x1;
+    return ZPP_lexer_bget(lexer, lexer->bstack_len - 1);
 }
 
 static void ZPP_lexer_bpop(ZPP_Lexer *lexer)
@@ -356,14 +363,29 @@ static void ZPP_lexer_bpop(ZPP_Lexer *lexer)
 static void ZPP_lexer_bpush(ZPP_Lexer *lexer, bool bit)
 {
     uint32_t bit_index = lexer->bstack_len++;
-    lexer->bstack[bit_index/32] &= ~((uint32_t)0x1 << bit_index%32);
-    lexer->bstack[bit_index/32] |= (uint32_t)bit << bit_index%32;
+
+    uint32_t mask = (uint32_t)0x1 << bit_index%32;
+    lexer->bstack[bit_index/32] &= ~mask;
+    lexer->bstack[bit_index/32] |= mask * bit;
+    lexer->bstack[bit_index/32 + 4] &= ~mask;
 }
 
-static void ZPP_lexer_bflip(ZPP_Lexer *lexer)
+static bool ZPP_lexer_btope(ZPP_Lexer *lexer)
 {
+    return ZPP_lexer_bget(lexer, lexer->bstack_len + 127);
+}
+
+static bool ZPP_lexer_bsete(ZPP_Lexer *lexer)
+{
+    if (ZPP_lexer_btope(lexer))
+    {
+        return true;
+    }
+    
     uint32_t bit_index = lexer->bstack_len - 1;
     lexer->bstack[bit_index/32] ^= (uint32_t)0x1 << bit_index%32;
+    lexer->bstack[bit_index/32 + 4] |= (uint32_t)0x1 << bit_index%32;
+    return false;
 }
 
 // NOTE: before using this remember to save the old location
@@ -983,7 +1005,7 @@ static void ZPP_context_push(ZPP_State *state, ZPP_ContextBlock *item)
         state->context_mem.len != 0 ?
         state->context->base.cur_len : 0;
     
-    ZPP_GEN_ARRAY_GROW(state, &state->context_mem,
+    ZPP_GEN_ARRAY_GROW(&state->context_mem,
                        char, item->base.cur_len);
     
     state->context =
@@ -1297,7 +1319,7 @@ static int ZPP_stringize_arg(ZPP_State *state, ZPP_Error *error,
         bool has_space =
             i != 0 && (tok.flags & (ZPP_TOKEN_SPACE | ZPP_TOKEN_BOL)) != 0;
         
-        ZPP_GEN_ARRAY_GROW(state, &result_str, char, tok.len + has_space);
+        ZPP_GEN_ARRAY_GROW(&result_str, char, tok.len + has_space);
         if (has_space) result_str.u.ptr[result_str.len - tok.len - 2] = ' ';
         ZPP_memcpy(result_str.u.ptr + result_str.len - tok.len - 1, tok.pos.ptr, tok.len);
     }
@@ -1626,7 +1648,7 @@ push_token:;
 
             if (is_stringize)
             {
-                ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, 1);
+                ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, 1);
 
                 tokens.u.tok[tokens.len - 1] = ident->tokens[i];
                 if ((ec = ZPP_stringize_arg(state, error,
@@ -1670,13 +1692,13 @@ push_token:;
                     is_lhs_empty = true;
                 }
 
-                ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, arg->len);
+                ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, arg->len);
                 ZPP_memcpy(tokens.u.tok + tokens.len - arg->len,
                            arg->ptr, arg->len*sizeof *tokens.u.tok);
             }
             else
             {
-                ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, 1);
+                ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, 1);
                 tokens.u.tok[tokens.len - 1] = ident->tokens[i];
             }
 
@@ -1727,7 +1749,7 @@ was_stringize:;
                         }
                     }
                         
-                    ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, arg.len - arg_skip);
+                    ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, arg.len - arg_skip);
                     ZPP_memcpy(tokens.u.tok + tokens.len -
                                arg.len + arg_skip, arg.ptr + arg_skip,
                                (arg.len - arg_skip)*sizeof *tokens.u.tok);
@@ -1759,7 +1781,7 @@ was_stringize:;
                     }
                     else
                     {
-                        ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, 1);
+                        ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, 1);
                         tokens.u.tok[tokens.len - 1] = pasted_tok;
                     }
 
@@ -2271,7 +2293,7 @@ read_token:;
                                  lexer->result.pos.ptr[1] == '.' &&
                                  lexer->result.pos.ptr[2] == '.') != false)
                             {
-                                ZPP_GEN_ARRAY_GROW(state, &args, ZPP_String, 1);
+                                ZPP_GEN_ARRAY_GROW(&args, ZPP_String, 1);
                                 
                                 args.u.str[args.len - 1] =
                                     (ZPP_String)
@@ -2318,7 +2340,7 @@ read_token:;
                         break;
                     }
                     
-                    ZPP_GEN_ARRAY_GROW(state, &tokens, ZPP_Token, 1);
+                    ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, 1);
                     
                     // for any token in the macro body that corrisiponds to a macro argument
                     // replace the token with the respective macro argument index 
@@ -2454,12 +2476,25 @@ pp_level0:;
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
+    else if (ZPP_string_cmp3(&lexer->result, "else"))
+    {
+        if (ZPP_lexer_bsete(lexer))
+        {
+            // TODO: come with better error message/code
+            return ZPP_return_error(&lexer->result.pos, error,
+                                    ZPP_ERROR_UNEXPECTED_TOK);
+        }
+
+        lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
+        goto read_token;
+    }
+        
     else if (blevel == 0)
     {
         if ((ZPP_string_cmp3(&lexer->result, "if") ||
              ZPP_string_cmp3(&lexer->result, "ifdef")))
         {
-            ++state->pp_if_counter;
+            ZPP_lexer_bpush(lexer, false);
         }
         
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
