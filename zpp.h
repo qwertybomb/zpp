@@ -150,6 +150,7 @@ typedef struct
     uint32_t bstack[8];
     uint32_t flags : 3;
     uint32_t bstack_len : 29;
+    uint32_t is_else_off;
 } ZPP_Lexer;
 
 typedef struct 
@@ -243,7 +244,6 @@ typedef struct
     ZPP_ContextBlock *context;
     ZPP_GenArray context_mem;
     
-    uint32_t pp_if_counter;
     uint32_t pp_if_gr_type;
 }  ZPP_State;
 
@@ -375,16 +375,26 @@ static bool ZPP_lexer_btope(ZPP_Lexer *lexer)
     return ZPP_lexer_bget(lexer, lexer->bstack_len + 127);
 }
 
-static bool ZPP_lexer_bsete(ZPP_Lexer *lexer)
+static void ZPP_lexer_bflip(ZPP_Lexer *lexer)
+{
+    uint32_t bit_index = lexer->bstack_len - 1;
+    lexer->bstack[bit_index/32] ^= (uint32_t)0x1 << bit_index%32;
+}
+
+static bool ZPP_lexer_belse(ZPP_Lexer *lexer)
 {
     if (ZPP_lexer_btope(lexer))
     {
         return true;
     }
+
+    if (!lexer->is_else_off)
+    {
+        uint32_t bit_index = lexer->bstack_len - 1;
+        lexer->bstack[bit_index/32] ^= (uint32_t)0x1 << bit_index%32;
+        lexer->bstack[bit_index/32 + 4] |= (uint32_t)0x1 << bit_index%32;
+    }
     
-    uint32_t bit_index = lexer->bstack_len - 1;
-    lexer->bstack[bit_index/32] ^= (uint32_t)0x1 << bit_index%32;
-    lexer->bstack[bit_index/32 + 4] |= (uint32_t)0x1 << bit_index%32;
     return false;
 }
 
@@ -2424,7 +2434,6 @@ read_token:;
                                     ZPP_ERROR_UNEXPECTED_TOK);
         }
 
-        state->pp_if_counter = 0;
         ZPP_lexer_bpush(lexer, ZPP_is_defined(state, &lexer->result));
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
@@ -2439,7 +2448,6 @@ read_token:;
                                     ZPP_ERROR_UNEXPECTED_TOK);
         }
 
-        state->pp_if_counter = 1;
         ZPP_lexer_bpush(lexer, !ZPP_is_defined(state, &lexer->result));
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
@@ -2457,7 +2465,6 @@ read_token:;
         }
         lexer = &state->context->lexer;
         
-        state->pp_if_counter = 1;
         state->context->base.flags &= ~(uint32_t)ZPP_CONTEXT_LOCK;
         ZPP_lexer_bpush(lexer, value.val != 0);
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
@@ -2473,18 +2480,59 @@ pp_level0:;
     if (ZPP_string_cmp3(&lexer->result, "endif"))
     {
         ZPP_lexer_bpop(lexer);
+        if (ZPP_lexer_btop(state->context) == 0)
+        {
+            lexer->is_else_off = 0;
+        }
+        
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
     else if (ZPP_string_cmp3(&lexer->result, "else"))
     {
-        if (ZPP_lexer_bsete(lexer))
+        if (ZPP_lexer_belse(lexer))
         {
             // TODO: come with better error message/code
             return ZPP_return_error(&lexer->result.pos, error,
                                     ZPP_ERROR_UNEXPECTED_TOK);
         }
 
+        lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
+        goto read_token;
+    }
+    else if (ZPP_string_cmp3(&lexer->result, "elif"))
+    {
+        if (ZPP_lexer_btope(lexer))
+        {
+            // TODO: make better error
+            return ZPP_return_error(&lexer->result.pos, error,
+                                    ZPP_ERROR_UNEXPECTED_TOK);
+        }
+                    
+        lexer->is_else_off |= blevel > 0;
+        if (lexer->is_else_off)
+        {
+            ZPP_lexer_bpop(lexer);
+            ZPP_lexer_bpush(lexer, 0);
+        }
+        else
+        {
+            // make it so that macros can't escape this line
+            state->context->base.flags |= ZPP_CONTEXT_LOCK;
+            ZPP_lexer_bpop(lexer);
+            
+            ZPP_PPNum value; 
+            if ((ec = ZPP_handle_if_pp(state, error,
+                                       &value, (ZPP_IfData){0})) < 0)
+            {
+                return ec;
+            }
+            lexer = &state->context->lexer;
+            
+            state->context->base.flags &= ~(uint32_t)ZPP_CONTEXT_LOCK;
+            ZPP_lexer_bpush(lexer, value.val != 0);
+        }
+        
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
