@@ -1322,11 +1322,10 @@ static int ZPP_paste_tokens(ZPP_State *state, ZPP_Error *error,
                                 ZPP_ERROR_INVALID_PASTE);
     }
 
-    // TODO: *VERY IMPORTANT* handle memory
     *result = lexer.result;
-    
     if (result->pos.ptr == concat_token_spell)
     {
+        // add to array of allocated tokens
         result->flags |= ZPP_TOKEN_ALLOC;
         ZPP_GEN_ARRAY_GROW(&state->line_buf, ZPP_Token, 1);
         state->line_buf.u.tok[state->line_buf.len - 1] = *result;
@@ -1391,6 +1390,7 @@ static int ZPP_stringize_arg(ZPP_State *state, ZPP_Error *error,
     result->pos.ptr = result_str.u.ptr;
     result->flags ^= (uint32_t)ZPP_TOKEN_PUNCT | (uint32_t)ZPP_TOKEN_STR;
 
+    // add to array of allocated tokens
     ZPP_GEN_ARRAY_GROW(&state->line_buf, ZPP_Token, 1);
     state->line_buf.u.tok[state->line_buf.len - 1] = *result;
     
