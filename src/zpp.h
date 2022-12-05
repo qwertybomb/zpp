@@ -15,6 +15,23 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#define ZPP_ARRAY(type) type *
+#define ZPP_ARRAY_NEW1() ZPP_array_new_impl(state, 0, 0, 0)
+#define ZPP_ARRAY_NEW2(t_, c_) ZPP_array_new_impl(state, t_, 0, c_)
+#define ZPP_ARRAY_NEW3(t_, s_) ZPP_array_new_impl(state, t_, s_, s_)
+
+#define ZPP_ARRAY_GROW(a_, g_)                          \
+    ZPP_array_grow_impl(state, a_, sizeof(**(a_)), g_)
+ 
+#define ZPP_ARRAY_FREE(a_)                          \
+    ZPP_gen_free(state, (ZPP_GenArray*)(a_) - 1)
+
+#define ZPP_ARRAY_MEM(a_)                       \
+    ((ZPP_GenArray*)(a_) - 1)
+
+#define ZPP_ALEN(a_)                            \
+    ((ZPP_GenArray*)(a_) - 1)->len
+
 /*
   NOTE: regarding whitespace and tokens
   normally in a lexer whitespace is just ignored and skipped.
@@ -212,14 +229,6 @@ typedef struct
 {
     size_t len;
     size_t cap;
-    union
-    {
-        char *ptr;
-        ZPP_Token *tok;
-        ZPP_TokenArray *tok_arr;
-        ZPP_ContextBlock *ctx;
-        ZPP_String *str;
-    } u;
 } ZPP_GenArray;
 
 typedef struct
@@ -238,12 +247,12 @@ typedef struct
 {
     ZPP_Token result;
     ZPP_Token peek_tok;
-    ZPP_GenArray line_buf;
+    void **line_buf;
     ZPP_IdentMap ident_map;
 
     ZPP_Allocator *allocator;
     ZPP_ContextBlock *context;
-    ZPP_GenArray context_mem;
+    char *context_mem;
 
     uint32_t pp_if_gr_type;
 }  ZPP_State;
@@ -257,7 +266,6 @@ ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error);
 */
 
 #ifdef ZPP_DEFINE
-
 #define ZPP_LEXER_TRY_READ(s_, e_)                           \
     do                                                       \
     {                                                        \
@@ -288,11 +296,6 @@ ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error);
                                     ZPP_ERROR_UNEXPECTED_EOL);       \
         }                                                            \
     } while (false)
-
-
-#define ZPP_STR_STATIC(str_) ((ZPP_String){.ptr=(str_), .len=sizeof((str_)) - 1})
-#define ZPP_GEN_ARRAY_GROW(a_, t_, g_)              \
-    ZPP_gen_array_grow_impl(state, a_, sizeof(t_), g_)
 
 static void *ZPP_memcpy(void *dest, void const *src, size_t size)
 {
@@ -1019,8 +1022,8 @@ static int ZPP_context_pop(ZPP_State *state)
         return 0;
     }
 
-    if (state->context_mem.len == 0 ||
-        (state->context_mem.len -=
+    if (ZPP_ALEN(state->context_mem) == 0 ||
+        (ZPP_ALEN(state->context_mem) -=
          state->context->base.cur_len) == 0)
     {
         return 0;
@@ -1032,33 +1035,51 @@ static int ZPP_context_pop(ZPP_State *state)
     return 1;
 }
 
-static void ZPP_gen_array_grow_impl(ZPP_State *state,
-                                    ZPP_GenArray *array,
-                                    size_t type, size_t grow)
+static void *ZPP_array_new_impl(ZPP_State *state,
+                                size_t type,
+                                size_t len, size_t cap)
 {
-    if (array->len + grow > array->cap)
+    ZPP_GenArray *block =
+        ZPP_gen_alloc(state, sizeof *block + cap * type);
+
+    block->len = len;
+    block->cap = cap;
+
+    return &block[1];
+}
+
+static void ZPP_array_grow_impl(ZPP_State *state,
+                                void *gen_array_ptr,
+                                size_t type, size_t grow)
+{
+    void **array_ptr = gen_array_ptr;
+    ZPP_GenArray *block = (ZPP_GenArray*)*array_ptr - 1;
+
+    if (block->len + grow > block->cap)
     {
-        array->cap = (array->len + grow)*3/2;
-        array->u.ptr =
-            ZPP_gen_realloc(state, array->u.ptr, array->cap * type);
+        block->cap = (block->len + grow)*3/2;
+        block = ZPP_gen_realloc(state, block,
+                                sizeof *block +
+                                block->cap * type);
+        *array_ptr = &block[1];
     }
 
-    array->len += grow;
+    block->len += grow;
 }
 
 static void ZPP_context_push(ZPP_State *state, ZPP_ContextBlock *item)
 {
     uint16_t prev_len =
-        state->context_mem.len != 0 ?
+        ZPP_ALEN(state->context_mem) != 0 ?
         state->context->base.cur_len : 0;
     
-    ZPP_GEN_ARRAY_GROW(&state->context_mem,
-                       char, item->base.cur_len);
+    ZPP_ARRAY_GROW(&state->context_mem, item->base.cur_len);
     
     state->context =
         (ZPP_ContextBlock*)
-        (state->context_mem.u.ptr +
-         state->context_mem.len - item->base.cur_len);
+        (state->context_mem +
+         ZPP_ALEN(state->context_mem) -
+         item->base.cur_len);
     
     ZPP_memcpy(state->context, item, item->base.cur_len);
     state->context->base.prev_len = prev_len;
@@ -1073,7 +1094,7 @@ static int ZPP_context_lex_direct(ZPP_State *state, ZPP_Error *error)
         return 1;
     }
     
-    if (state->context_mem.len == 0)
+    if (ZPP_ALEN(state->context_mem) == 0)
     {
         return 0;
     }
@@ -1116,9 +1137,8 @@ static int ZPP_context_lex_direct(ZPP_State *state, ZPP_Error *error)
                     
                     if (ZPP_context_pop(state) != 0)
                     {
-                        ZPP_gen_free(state,
-                                     macro_context->tokens -
-                                     macro_context->token_total);
+                        ZPP_ARRAY_FREE(macro_context->tokens -
+                                       macro_context->token_total);
                         continue;
                     }
                     
@@ -1267,6 +1287,15 @@ ZPP_LINKAGE int ZPP_init_state(ZPP_State *state, char *file_data)
                            sizeof *state->ident_map.keys);
     }
 
+    if (state->line_buf == NULL)
+    {
+        state->line_buf = ZPP_ARRAY_NEW1();
+    }
+
+    if (state->context_mem == NULL)
+    {
+        state->context_mem = ZPP_ARRAY_NEW1();
+    }
 
     if (file_data != NULL)
     {
@@ -1291,7 +1320,8 @@ static int ZPP_paste_tokens(ZPP_State *state, ZPP_Error *error,
                             ZPP_Pos *paste_pos)
 {
     // NOTE: most c preprocessors seem to do it this way
-    char *concat_token_spell = ZPP_gen_alloc(state, result->len + rhs->len + 1);
+    char *concat_token_spell =
+        ZPP_gen_alloc(state, result->len + rhs->len + 1);
 
     ZPP_memcpy(concat_token_spell, result->pos.ptr, result->len);
     ZPP_memcpy(concat_token_spell + result->len, rhs->pos.ptr, rhs->len);
@@ -1327,8 +1357,9 @@ static int ZPP_paste_tokens(ZPP_State *state, ZPP_Error *error,
     {
         // add to array of allocated tokens
         result->flags |= ZPP_TOKEN_ALLOC;
-        ZPP_GEN_ARRAY_GROW(&state->line_buf, ZPP_Token, 1);
-        state->line_buf.u.tok[state->line_buf.len - 1] = *result;
+        ZPP_ARRAY_GROW(&state->line_buf, 1);
+        state->line_buf[ZPP_ALEN(state->line_buf) - 1] =
+            result->pos.ptr;
     }
     else
     {
@@ -1351,7 +1382,7 @@ static void ZPP_fix_ident_token(ZPP_Token *token)
 // TODO: figure out how to handle memory mangement(will probably be similar to token paste)
 static int ZPP_stringize_arg(ZPP_State *state, ZPP_Error *error,
                              ZPP_Token *result, ZPP_Token arg,
-                             ZPP_GenArray *macro_args)
+                             ZPP_TokenArray *macro_args)
 {
     // TODO: maybe we should just handle this when actually parsing macro define
     if ((arg.flags & ZPP_TOKEN_MACRO_ARG) == 0)
@@ -1360,14 +1391,9 @@ static int ZPP_stringize_arg(ZPP_State *state, ZPP_Error *error,
                                 ZPP_ERROR_INVALID_MACRO);
     }
     
-    ZPP_TokenArray args = macro_args->u.tok_arr[arg.len];
-    ZPP_GenArray result_str = {
-        .u.ptr = ZPP_gen_alloc(state, 2),
-        .cap = 2,
-        .len = 2
-    };
-
-    result_str.u.ptr[0] = '"';
+    ZPP_TokenArray args = macro_args[arg.len];
+    char *result_str = ZPP_ARRAY_NEW3(sizeof *result_str, 2);
+    result_str[0] = '"';
 
     // append each token to the result string
     for (uint32_t i = 0; i < args.len; ++i)
@@ -1377,22 +1403,25 @@ static int ZPP_stringize_arg(ZPP_State *state, ZPP_Error *error,
         bool has_space =
             i != 0 && (tok.flags & (ZPP_TOKEN_SPACE | ZPP_TOKEN_BOL)) != 0;
         
-        ZPP_GEN_ARRAY_GROW(&result_str, char, tok.len + has_space);
-        if (has_space) result_str.u.ptr[result_str.len - tok.len - 2] = ' ';
-        ZPP_memcpy(result_str.u.ptr + result_str.len - tok.len - 1, tok.pos.ptr, tok.len);
+        ZPP_ARRAY_GROW(&result_str, tok.len + has_space);
+
+        size_t str_len = ZPP_ALEN(result_str);
+        if (has_space) result_str[str_len - tok.len - 2] = ' ';
+        ZPP_memcpy(result_str + str_len - tok.len - 1, tok.pos.ptr, tok.len);
     }
     
     // NOTE: there will always be enough memory for a closing quote
-    result_str.u.ptr[result_str.len - 1] = '"';
+    result_str[ZPP_ALEN(result_str) - 1] = '"';
     
     // NOTE: assumes result is a `#` token
-    result->len = (uint32_t)result_str.len;
-    result->pos.ptr = result_str.u.ptr;
+    result->len = (uint32_t)ZPP_ALEN(result_str);
+    result->pos.ptr = result_str;
     result->flags ^= (uint32_t)ZPP_TOKEN_PUNCT | (uint32_t)ZPP_TOKEN_STR;
 
-    // add to array of allocated tokens
-    ZPP_GEN_ARRAY_GROW(&state->line_buf, ZPP_Token, 1);
-    state->line_buf.u.tok[state->line_buf.len - 1] = *result;
+    // keep track of allocated memory
+    ZPP_ARRAY_GROW(&state->line_buf, 1);
+    state->line_buf[ZPP_ALEN(state->line_buf) - 1] =
+        ZPP_ARRAY_MEM(result_str);
     
     return 1;
 }
@@ -1527,8 +1556,8 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
         return 1;
     }
  
-    ZPP_GenArray macro_args = {0};
-    ZPP_GenArray expand_macro_args = {0};
+    ZPP_TokenArray *macro_args = NULL;
+    ZPP_TokenArray *expand_macro_args = NULL;
     if (ident->is_fn_macro)
     {
         // peek a token ahead for '(' and if not found just leave this token alone
@@ -1547,15 +1576,12 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
 
         // read the macro function arguments
         size_t token_args_cap = 0;
-        macro_args = (ZPP_GenArray) {
-            .u.tok_arr = ZPP_gen_alloc(state,
-                                       ident->arg_len *
-                                       sizeof *macro_args.u.tok_arr),
-        };
+        macro_args =
+            ZPP_ARRAY_NEW2(sizeof *macro_args, ident->arg_len);
         
         if (ident->arg_len != 0)
         {
-            macro_args.u.tok_arr[0] = (ZPP_TokenArray){0};
+            macro_args[0] = (ZPP_TokenArray){0};
         }
 
         // NOTE: we need to handle cases where a macro currently not enabled
@@ -1578,15 +1604,17 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
                 }
 
                 // handle the case where arguments can omitted
-                if (macro_args.len != ident->arg_len &&
+                if (ZPP_ALEN(macro_args) != ident->arg_len &&
                     (ident->is_va_args || ident->arg_len == 1))
                 {
-                    macro_args.len = ident->arg_len;
-                    macro_args.u.tok_arr[macro_args.len - 1] = (ZPP_TokenArray){0};
+                    size_t *macro_args_len =
+                        &ZPP_ALEN(macro_args);
+                    *macro_args_len = ident->arg_len;
+                    macro_args[*macro_args_len - 1] = (ZPP_TokenArray){0};
                 }
 
                 // return an error if the macro did not have enough arguments
-                if (ident->arg_len != macro_args.len)
+                if (ident->arg_len != ZPP_ALEN(macro_args))
                 {
                     return ZPP_return_error(&state->result.pos, error,
                                             ZPP_ERROR_INVALID_MACRO);
@@ -1595,9 +1623,9 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
                 break;
             }
                 
-            if (macro_args.len == 0)
+            if (ZPP_ALEN(macro_args) == 0)
             {
-                macro_args.len = 1;
+                ZPP_ALEN(macro_args) = 1;
             }
 
             if (*state->result.pos.ptr == '(')
@@ -1607,10 +1635,11 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
             else if (*state->result.pos.ptr == ',' && scope_level < 2)
             {
                 // we have a new argument
-                if (macro_args.len != ident->arg_len)
+                if (ZPP_ALEN(macro_args) != ident->arg_len)
                 {
                     token_args_cap = 0;
-                    macro_args.u.tok_arr[macro_args.len++] = (ZPP_TokenArray){0};   
+                    macro_args[ZPP_ALEN(macro_args)++] =
+                        (ZPP_TokenArray){0};   
                     continue;
                 }
 
@@ -1625,7 +1654,8 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
             }
             
 push_token:;
-            ZPP_TokenArray *current = &macro_args.u.tok_arr[macro_args.len - 1];
+            ZPP_TokenArray *current =
+                &macro_args[ZPP_ALEN(macro_args) - 1];
             if (++current->len > token_args_cap)
             {
                 token_args_cap = (token_args_cap + 1)*3/2;
@@ -1658,17 +1688,15 @@ push_token:;
             }
         }
 
-        expand_macro_args = (ZPP_GenArray) {
-            .u.tok_arr = ZPP_gen_alloc(state,
-                                       ident->arg_len *
-                                       sizeof *macro_args.u.tok_arr),
-            .len = ident->arg_len,
-        };
+        expand_macro_args =
+            ZPP_ARRAY_NEW3(sizeof *expand_macro_args, ident->arg_len);
 
-        for (uint32_t i = 0; i < macro_args.len; ++i)
+        size_t macro_args_len =
+            ZPP_ALEN(macro_args);
+        for (uint32_t i = 0; i < macro_args_len; ++i)
         {
             ZPP_TokenArray src =
-                macro_args.u.tok_arr[i];
+                macro_args[i];
             
             ZPP_TokenArray copy = {
                 .ptr = ZPP_gen_alloc(state,
@@ -1677,7 +1705,7 @@ push_token:;
             };
 
             ZPP_memcpy(copy.ptr, src.ptr, src.len*sizeof *src.ptr);
-            expand_macro_args.u.tok_arr[i] = copy;
+            expand_macro_args[i] = copy;
 
             // fix unexpanded macros
             for (uint32_t j = 0; j < src.len; ++j)
@@ -1691,12 +1719,8 @@ push_token:;
     *had_macro = true;
     if (ident->token_len != 0)
     {
-        ZPP_GenArray tokens = {
-            .cap = ident->token_len,
-            .u.tok = ZPP_gen_alloc(state,
-                                   ident->token_len *
-                                   sizeof *tokens.u.tok)
-        };
+        ZPP_Token *tokens =
+            ZPP_ARRAY_NEW2(sizeof *tokens, ident->token_len);
         
         for (uint32_t i = 0; i < ident->token_len; ++i)
         {
@@ -1713,12 +1737,14 @@ push_token:;
 
             if (is_stringize)
             {
-                ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, 1);
+                ZPP_ARRAY_GROW(&tokens, 1);
 
-                tokens.u.tok[tokens.len - 1] = ident->tokens[i];
+                size_t tok_len = ZPP_ALEN(tokens);
+                tokens[tok_len - 1] = ident->tokens[i];
                 if ((ec = ZPP_stringize_arg(state, error,
-                                            &tokens.u.tok[tokens.len - 1],
-                                            ident->tokens[i + 1], &macro_args)) < 0)
+                                            &tokens[tok_len - 1],
+                                            ident->tokens[i + 1],
+                                            macro_args)) < 0)
                 {
                     return ec;
                 }
@@ -1734,7 +1760,7 @@ push_token:;
                 if (!is_paste_next)
                 {
                     arg =
-                        &expand_macro_args.u.tok_arr[ident->tokens[i].len];
+                        &expand_macro_args[ident->tokens[i].len];
 
                     if (arg->cap != UINT32_MAX &&
                         (ec = ZPP_expand_macro_arg(state, error, arg)) < 0)
@@ -1748,7 +1774,7 @@ push_token:;
                 }
                 else
                 {
-                    arg = &macro_args.u.tok_arr[ident->tokens[i].len];
+                    arg = &macro_args[ident->tokens[i].len];
                 }
                 
                 // if the arg is empty we don't need to append anything
@@ -1757,14 +1783,15 @@ push_token:;
                     is_lhs_empty = true;
                 }
 
-                ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, arg->len);
-                ZPP_memcpy(tokens.u.tok + tokens.len - arg->len,
-                           arg->ptr, arg->len*sizeof *tokens.u.tok);
+                ZPP_ARRAY_GROW(&tokens, arg->len);
+                ZPP_memcpy(tokens +
+                           ZPP_ALEN(tokens) - arg->len,
+                           arg->ptr, arg->len*sizeof *tokens);
             }
             else
             {
-                ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, 1);
-                tokens.u.tok[tokens.len - 1] = ident->tokens[i];
+                ZPP_ARRAY_GROW(&tokens, 1);
+                tokens[ZPP_ALEN(tokens) - 1] = ident->tokens[i];
             }
 
 was_stringize:;
@@ -1779,7 +1806,7 @@ was_stringize:;
                         ident->tokens[i].len == ident->arg_len - 1; 
 
                     ZPP_TokenArray arg =
-                        macro_args.u.tok_arr[ident->tokens[i].len];
+                        macro_args[ident->tokens[i].len];
                         
                     // if the arg is empty we don't need to append anything
                     if (arg.len == 0)
@@ -1788,9 +1815,9 @@ was_stringize:;
                         // NOTE: GNU extension __VA_ARGS__ comma omission
                         // ,##__VA_ARGS__ becomes empty when __VA_ARGS__ is empty
                         if (!is_lhs_empty && is_tok_va_args &&
-                            *tokens.u.tok[tokens.len - 1].pos.ptr == ',')
+                            *tokens[ZPP_ALEN(tokens) - 1].pos.ptr == ',')
                         {
-                            --tokens.len;
+                            --ZPP_ALEN(tokens);
                         }
 
                         continue;
@@ -1801,12 +1828,12 @@ was_stringize:;
                     {
                         // NOTE: for gcc ,##__VA_ARGS__ it just appends __VA_ARGS__
                         if (is_tok_va_args &&
-                            *tokens.u.tok[tokens.len - 1].pos.ptr == ',')
+                            *tokens[ZPP_ALEN(tokens) - 1].pos.ptr == ',')
                         {
                             arg_skip = false;
                         }
                         else if ((ec = ZPP_paste_tokens(state, error,
-                                                        &tokens.u.tok[tokens.len - 1],
+                                                        &tokens[ZPP_ALEN(tokens) - 1],
                                                         &arg.ptr[0],
                                                         &ident->tokens[i - 1].pos)) < 0)
                         {
@@ -1814,10 +1841,11 @@ was_stringize:;
                         }
                     }
                         
-                    ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, arg.len - arg_skip);
-                    ZPP_memcpy(tokens.u.tok + tokens.len -
+                    ZPP_ARRAY_GROW(&tokens, arg.len - arg_skip);
+                    ZPP_memcpy(tokens +
+                               ZPP_ALEN(tokens) -
                                arg.len + arg_skip, arg.ptr + arg_skip,
-                               (arg.len - arg_skip)*sizeof *tokens.u.tok);
+                               (arg.len - arg_skip)*sizeof *tokens);
                 }
                 else
                 {
@@ -1827,8 +1855,10 @@ was_stringize:;
                          ident->tokens[i].len == 1 &&
                          *ident->tokens[i].pos.ptr == '#') != false)
                     {
-                        if ((ec = ZPP_stringize_arg(state, error, &pasted_tok,
-                                                    ident->tokens[i + 1], &macro_args)) < 0)
+                        if ((ec = ZPP_stringize_arg(state, error,
+                                                    &pasted_tok,
+                                                    ident->tokens[i + 1],
+                                                    macro_args)) < 0)
                         {
                             return ec;
                         }
@@ -1837,7 +1867,7 @@ was_stringize:;
                     if (!is_lhs_empty)
                     {
                         if (((ec = ZPP_paste_tokens(state, error,
-                                                    &tokens.u.tok[tokens.len - 1],
+                                                    &tokens[ZPP_ALEN(tokens) - 1],
                                                     &pasted_tok,
                                                     &ident->tokens[i - 1].pos)) < 0))
                         {
@@ -1846,8 +1876,8 @@ was_stringize:;
                     }
                     else
                     {
-                        ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, 1);
-                        tokens.u.tok[tokens.len - 1] = pasted_tok;
+                        ZPP_ARRAY_GROW(&tokens, 1);
+                        tokens[ZPP_ALEN(tokens) - 1] = pasted_tok;
                     }
 
                     i += is_stringize;
@@ -1860,16 +1890,16 @@ was_stringize:;
                      *ident->tokens[i + 1].pos.ptr == '#');            
         }
 
-        if (tokens.len != 0)
+        if (ZPP_ALEN(tokens) != 0)
         {
-            tokens.u.tok[0].flags |= ident_tok.flags & ZPP_TOKEN_SPACE;
+            tokens[0].flags |= ident_tok.flags & ZPP_TOKEN_SPACE;
         }
         
         // make all the tokens expanded from this macro have the location of the macro
-        for (size_t i = 0; i < tokens.len; ++i)
+        for (size_t i = 0; i < ZPP_ALEN(tokens); ++i)
         {
-            tokens.u.tok[i].pos.row = ident_tok.pos.row;
-            tokens.u.tok[i].pos.col = ident_tok.pos.col;
+            tokens[i].pos.row = ident_tok.pos.row;
+            tokens[i].pos.col = ident_tok.pos.col;
         }
         
         // disable the macro before expanding it
@@ -1879,16 +1909,16 @@ was_stringize:;
                          {
                              .macro_context = {
                                  .macro = ident,
-                                 .tokens = tokens.u.tok,
-                                 .token_len = (uint32_t)tokens.len,
-                                 .token_total = (uint32_t)tokens.len,
+                                 .tokens = tokens,
+                                 .token_len = (uint32_t)ZPP_ALEN(tokens),
+                                 .token_total = (uint32_t)ZPP_ALEN(tokens),
                                  .base.flags = ZPP_CONTEXT_MACRO,
                                  .base.cur_len = sizeof(ZPP_MacroContext),
                              }
                          });
 
-        ZPP_gen_free(state, macro_args.u.ptr);
-        ZPP_gen_free(state, expand_macro_args.u.ptr);
+        if (macro_args != NULL) ZPP_ARRAY_FREE(macro_args);
+        if (expand_macro_args != NULL) ZPP_ARRAY_FREE(expand_macro_args);
     }
     
     return 1;
@@ -2264,13 +2294,13 @@ op_break:;
 
 static void ZPP_clear_line_buf(ZPP_State *state)
 {
-    ZPP_GenArray *line = &state->line_buf;
-    for (size_t i = 0; i < line->len; ++i)
+    size_t *len = &ZPP_ALEN(state->line_buf);
+    for (size_t i = 0; i < *len; ++i)
     {
-        ZPP_gen_free(state, line->u.tok[i].pos.ptr);
+        ZPP_gen_free(state, state->line_buf[i]);
     }
 
-    line->len = 0;
+    *len = 0;
 }
 
 ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error)
@@ -2355,8 +2385,8 @@ read_token:;
             .name_len = (uint32_t)name_str.len,
             .is_macro = true,
         };
-        ZPP_GenArray tokens = {0};
         
+        ZPP_Token *tokens = ZPP_ARRAY_NEW1();
         for(;;)
         {
             ec = ZPP_lexer_lex_direct(lexer, error);
@@ -2364,17 +2394,17 @@ read_token:;
             {
                 case 0:
                 {
-                    if (tokens.len != 0 &&
-                        ((tokens.u.tok[0].len == 2 &&
-                          *tokens.u.tok[0].pos.ptr == '#') ||
-                         *tokens.u.tok[tokens.len - 1].pos.ptr == '#'))
+                    if (ZPP_ALEN(tokens) != 0 &&
+                        ((tokens[0].len == 2 &&
+                          *tokens[0].pos.ptr == '#') ||
+                         *tokens[ZPP_ALEN(tokens) - 1].pos.ptr == '#'))
                     {
                         return ZPP_return_error(&name_pos, error,
                                                 ZPP_ERROR_INVALID_MACRO); 
                     }
 
-                    new_macro.tokens = tokens.u.tok;
-                    new_macro.token_len = (uint32_t)tokens.len;
+                    new_macro.tokens = tokens;
+                    new_macro.token_len = (uint32_t)ZPP_ALEN(tokens);
                     
                     lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
                     if (macro == NULL)
@@ -2402,7 +2432,7 @@ read_token:;
                         (lexer->result.flags & ZPP_TOKEN_SPACE) == 0)
                     {
                         bool first_read = true;
-                        ZPP_GenArray args = {0};
+                        ZPP_String *args = ZPP_ARRAY_NEW1();
                         new_macro.is_fn_macro = true;
                         
                         for(;;)
@@ -2417,9 +2447,9 @@ read_token:;
                                  lexer->result.pos.ptr[1] == '.' &&
                                  lexer->result.pos.ptr[2] == '.') != false)
                             {
-                                ZPP_GEN_ARRAY_GROW(&args, ZPP_String, 1);
+                                ZPP_ARRAY_GROW(&args, 1);
                                 
-                                args.u.str[args.len - 1] =
+                                args[ZPP_ALEN(args) - 1] =
                                     (ZPP_String)
                                     {
                                         .len = lexer->result.len,
@@ -2459,12 +2489,12 @@ read_token:;
                             first_read = false;
                         }
 
-                        new_macro.args = args.u.str;
-                        new_macro.arg_len = (uint32_t)args.len;
+                        new_macro.args = args;
+                        new_macro.arg_len = (uint32_t)ZPP_ALEN(args);
                         break;
                     }
                     
-                    ZPP_GEN_ARRAY_GROW(&tokens, ZPP_Token, 1);
+                    ZPP_ARRAY_GROW(&tokens, 1);
                     
                     // for any token in the macro body that corrisiponds to a macro argument
                     // replace the token with the respective macro argument index 
@@ -2490,10 +2520,10 @@ read_token:;
                         }
                     }
                     
-                    tokens.u.tok[tokens.len - 1] = lexer->result;
+                    tokens[ZPP_ALEN(tokens) - 1] = lexer->result;
                     if (first_token)
                     {
-                        tokens.u.tok[tokens.len - 1].flags &=
+                        tokens[ZPP_ALEN(tokens) - 1].flags &=
                             ~(uint32_t)ZPP_TOKEN_SPACE;
                     }
 
@@ -2523,8 +2553,8 @@ read_token:;
         if (macro != NULL)
         {
             macro->is_macro = false;
-            ZPP_gen_free(state, macro->args);
-            ZPP_gen_free(state, macro->tokens);
+            if (macro->args != 0) ZPP_ARRAY_FREE(macro->args);
+            if (macro->tokens != 0) ZPP_ARRAY_FREE(macro->tokens);
             
             ec = ZPP_lexer_lex_direct(lexer, error);
             if (ec < 0) return ec;
@@ -2668,8 +2698,6 @@ pp_level0:;
    
 #undef ZPP_DIRECTIVE_TRY_READ
 }
-
-//#undef ZPP_STR_STATIC
 //#undef ZPP_GEN_ARRAY_GROW
 //#undef ZPP_LEXER_TRY_READ
 //#undef ZPP_LEXER_TRY_READ_FULL

@@ -96,7 +96,7 @@ static int ZPP_define_macro(ZPP_State *state,
     ZPP_Token *tokens = NULL;
     if (ec != 0)
     {
-        tokens = ZPP_gen_alloc(state, sizeof *tokens);
+        tokens = ZPP_ARRAY_NEW3(sizeof *tokens, 1);
         tokens[0] = lexer.result;
     }
     
@@ -121,7 +121,7 @@ static int ZPP_define_macro(ZPP_State *state,
         new_macro.name = old_macro->name;
         new_macro.hash = old_macro->hash;
 
-        ZPP_gen_free(state, old_macro->tokens);
+        ZPP_ARRAY_FREE(old_macro->tokens);
         *old_macro = new_macro;
     }
     else
