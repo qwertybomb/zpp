@@ -2,11 +2,13 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
+#include "platform.h"
+
 #define ZPP_DEFINE
 #define ZPP_LINKAGE static
 #include "zpp.h"
 
-#include <time.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -75,7 +77,6 @@ static void alloc_gen_free(void *ctx, void *ptr)
     free(ptr);
 }
 
-
 static int ZPP_define_macro(ZPP_State *state,
                             ZPP_Error *error, 
                             char *name, char *val)
@@ -139,7 +140,8 @@ int main(int argc, char **argv)
     int ec = 0;
     ZPP_Error error = {0};
 
-    time_t start_time = time(NULL);
+    start_clock();
+    int64_t start_time = get_clock();
     ZPP_State state = {
         .allocator = &(ZPP_Allocator)
         {
@@ -231,7 +233,7 @@ int main(int argc, char **argv)
         fwrite(token.pos.ptr, 1, token.len, stdout);
     }
     
-    time_t end_time = time(NULL);
+    int64_t end_time = get_clock();
     if (dump_macros)
     {
         printf("\n\n---------------------\n"
@@ -289,14 +291,13 @@ int main(int argc, char **argv)
             }
 
             printf("\n");
-            fflush(stdout);
         }
     }
     
     if (print_time)
     {
         printf("\nIt took %g seconds.\n",
-               (double)(end_time - start_time) / CLOCKS_PER_SEC);
+               (double)(end_time - start_time)/clocks_per_sec);
     }
 
     return 0;

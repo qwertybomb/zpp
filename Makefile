@@ -1,28 +1,31 @@
-CC=cl
-LINK=link
 SRC=src
-EXE=prog.exe
 BIN=bin
-MODE=RELEASE
-FLAGS=-nologo -W4 -permissive- -wd4200
+LINK=link
+EXE=prog.exe
+MODE=DEBUG
 LIBS=kernel32.lib
+FLAGS=-nologo -W4 -permissive- -wd4200
 LINK_FLAGS=-incremental:no -out:$(EXE)
 
 !IF "$(MODE)" == "DEBUG"
 FLAGS=$(FLAGS) -Od -Zi
 LINK_FLAGS=$(LINK_FLAGS) -debug
 !ELSE
-FLAGS=$(FLAGS) -O2 -Oi -Zi
+FLAGS=$(FLAGS) -O1 -Oi
 !ENDIF
 
 !IF "$(CC)" == "clang-cl"
 FLAGS=$(FLAGS) -Werror-implicit-function-declaration \
-	-clang:"-fdiagnostics-format=clang" -Wsign-conversion
+	-clang:"-fdiagnostics-format=clang" -Wsign-conversion \
+	-fdiagnostics-absolute-paths
+!IF "$(MODE)" != "DEBUG"
+FLAGS=$(FLAGS) -O2
+!ENDIF
 !ENDIF
 
-$(EXE): $(SRC)\*.c $(SRC)\*.h
-	@$(CC) $(FLAGS) -Fo$(BIN)\ $(SRC)\*.c -link $(LINK_FLAGS) $(LIBS) -out:$(EXE)
-all: $(EXE)
+all: $(SRC)\*.c $(SRC)\*.h
+	@$(CC) $(FLAGS) -Fo$(BIN)\ $(SRC)\*.c \
+	-link $(LINK_FLAGS) $(LIBS) -out:$(EXE)
 
 .IGNORE:
 clean:
