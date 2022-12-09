@@ -188,7 +188,7 @@ typedef struct
     uint32_t token_len;
     uint32_t arg_len;
     uint32_t name_len;
-    
+
     bool is_alive : 1;
     bool is_va_args : 1;
     bool is_fn_macro : 1;
@@ -1212,8 +1212,9 @@ static ZPP_Ident *ZPP_ident_map_get(ZPP_State *state, ZPP_String name)
     for(uint32_t i = 0; i < state->ident_map.cap; ++i)
     {
         ZPP_Ident *key = &state->ident_map.keys[map_index];
-        if (key->is_alive &&
-            key->hash == name_hash &&
+        if (!key->is_alive) break;
+        
+        if (key->hash == name_hash &&
             ZPP_string_cmp((ZPP_String){key->name, key->name_len}, name))
         {
             return key;
@@ -1535,21 +1536,6 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
     
     ZPP_Token ident_tok = state->result;
     if (ident == NULL) 
-    {
-        if ((state->result.flags & ZPP_TOKEN_ALLOC) == 0)
-        {
-            ZPP_ident_map_set(state,
-                              &(ZPP_Ident)
-                              {
-                                  .name = name_str.ptr,
-                                  .name_len = (uint32_t)name_str.len,
-                                  .is_macro = false,
-                              });
-        }
-        
-        return 1;
-    }
-    else if (!ident->is_macro)
     {
         return 1;
     }
@@ -1979,23 +1965,7 @@ static bool ZPP_is_defined(ZPP_State *state, ZPP_Token *macro_tok)
     ZPP_Ident *ident =
         ZPP_ident_map_get(state, ZPP_tok_to_str(macro_tok));
 
-    if (ident == NULL)
-    {
-        if ((macro_tok->flags & ZPP_TOKEN_ALLOC) == 0)
-        {
-            ZPP_ident_map_set(state,
-                              &(ZPP_Ident)
-                              {
-                                  .name = macro_tok->pos.ptr,
-                                  .name_len = macro_tok->len,
-                                  .is_macro = false,
-                              });
-        }
-
-        return false;
-    }
-
-    return ident->is_macro;
+    return ident != NULL;
 }
 
 // TODO: handle sign, char literals, more number literals, more Ops, and short circut. 
