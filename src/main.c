@@ -36,21 +36,11 @@ static char *read_whole_file(char const *path)
 }
 
 // TODO: maybe put this into the zpp library
-static void ZPP_print_error(ZPP_Error const *error)
+static void ZPP_print_error(char const *file_path, ZPP_Error *error)
 {
-    static char const *error_messages[] = {
-        [ZPP_ERROR_UNEXPECTED_EOF]   = "unexpected eof found",
-        [ZPP_ERROR_UNTERMINATED_STR] = "unterminated string literal",
-        [ZPP_ERROR_UNTERMINATED_CHR] = "unterminated char literal",
-        [ZPP_ERROR_UNEXPECTED_EOL]   = "unexpected eol found",
-        [ZPP_ERROR_UNEXPECTED_TOK]   = "unexpected token found",
-        [ZPP_ERROR_INVALID_MACRO] = "invalid macro found",
-        [ZPP_ERROR_INVALID_PASTE] = "invalid paste formed",
-    };
-    
-    printf("\n<source>:%u:%u: error: %s\n",
-           error->row + 1, error->col,
-           error_messages[error->error_code]);
+    printf("%s:%u:%u: error: %.*s\n",
+           file_path, error->row + 1, error->col +1,
+           (int)error->msg_len, error->msg);
 }
 
 static void *alloc_gen_alloc(void *ctx, size_t size)
@@ -97,7 +87,7 @@ static int ZPP_define_macro(ZPP_State *state,
     ZPP_Token *tokens = NULL;
     if (ec != 0)
     {
-        tokens = ZPP_ARRAY_NEW3(sizeof *tokens, 1);
+        tokens = ZPP_gen_alloc(state, sizeof *tokens);
         tokens[0] = lexer.result;
     }
     
@@ -122,7 +112,7 @@ static int ZPP_define_macro(ZPP_State *state,
         new_macro.name = old_macro->name;
         new_macro.hash = old_macro->hash;
 
-        ZPP_ARRAY_FREE(old_macro->tokens);
+        ZPP_gen_free(state, old_macro->tokens);
         *old_macro = new_macro;
     }
     else
@@ -130,7 +120,6 @@ static int ZPP_define_macro(ZPP_State *state,
         ZPP_ident_map_set(state, &new_macro);
     }
 
-    ZPP_gen_free(state, tokens);
     return 1;
 }
 
@@ -164,14 +153,22 @@ int main(int argc, char **argv)
             char *macro_name = argv[i] + 2;
             if (*macro_name == '\0') continue;
             
-            char *macro_val = strstr(macro_name, "=");
-            if (macro_val == NULL) macro_val = "";
-            else macro_val[-1] = '\0';
+            char *macro_val;
+            if ((macro_val = strstr(macro_name, "=")) == NULL)
+            {
+                macro_val = "";
+        
+            }
+            else
+            {
+                *macro_val++ = '\0';
+            }
             
             if (ZPP_define_macro(&state, &error, 
                                  macro_name, macro_val) < 0)
             {
-                goto error;
+                ZPP_print_error("<arg>", &error);
+                return 1;
             }  
                                 
         }
@@ -205,8 +202,9 @@ int main(int argc, char **argv)
         }
         else if (ec == -1)
         {
-            goto error;
-            break;
+            putchar('\n');
+            ZPP_print_error(file_path, &error);
+            return 1;
         }
 
         ZPP_Token token = state.result;
@@ -301,7 +299,4 @@ int main(int argc, char **argv)
     }
 
     return 0;
-    
-error:
-    ZPP_print_error(&error);
 }

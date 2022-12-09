@@ -101,17 +101,11 @@ enum
     ZPP_TYPE_SUBGT,      // ->
 };
 
-// TODO: fix error code system
-enum
-{
-    ZPP_ERROR_UNEXPECTED_EOF,
-    ZPP_ERROR_UNTERMINATED_STR,
-    ZPP_ERROR_UNTERMINATED_CHR,
-    ZPP_ERROR_UNEXPECTED_EOL,
-    ZPP_ERROR_UNEXPECTED_TOK,
-    ZPP_ERROR_INVALID_MACRO,
-    ZPP_ERROR_INVALID_PASTE,
-};
+#define ZPP_ERROR_INVALID_MACRO "invalid macro"
+#define ZPP_ERROR_INVALID_PASTE "invalid paste"
+#define ZPP_ERROR_UNEXPECTED_TOK "unexpected token"
+#define ZPP_ERROR_UNEXPECTED_EOL "unexpected ending"
+#define ZPP_ERROR_UNEXPECTED_EOF "unexpected ending"
 
 typedef struct ZPP_Allocator ZPP_Allocator;
 struct ZPP_Allocator
@@ -170,18 +164,19 @@ typedef struct
     uint32_t is_else_off;
 } ZPP_Lexer;
 
-typedef struct 
-{
-    uint32_t row;
-    uint32_t col;
-    uint32_t error_code;
-} ZPP_Error;
-
 typedef struct
 {
     char *ptr;
     size_t len;
 } ZPP_String;
+
+typedef struct 
+{
+    uint32_t row;
+    uint32_t col;
+    size_t msg_len;
+    char const *msg;
+} ZPP_Error;
 
 typedef struct
 {
@@ -235,6 +230,7 @@ typedef struct
 {
     int32_t min_prec;
     uint32_t pr_level;
+    
 } ZPP_IfData;
 
 typedef struct
@@ -253,8 +249,9 @@ typedef struct
     ZPP_Allocator *allocator;
     ZPP_ContextBlock *context;
     ZPP_ARRAY(char) context_mem;
-
+    
     uint32_t pp_if_gr_type;
+    bool pp_if_noeval;
 }  ZPP_State;
 
 ZPP_LINKAGE int ZPP_init_state(ZPP_State *state, char *file_data);
@@ -306,6 +303,13 @@ static void *ZPP_memcpy(void *dest, void const *src, size_t size)
     return dest;
 }
 
+static size_t ZPP_strlen(char const *str)
+{
+    size_t len = 0;
+    while (*str++) ++len;
+    return len;
+}
+
 static bool ZPP_is_horizontal_space(char ch)
 {
     return ch == ' ' || ch == '\t' || ch == '\r';          
@@ -334,11 +338,13 @@ static bool ZPP_is_newline_escape(char *ptr)
 
 static int ZPP_return_error(ZPP_Pos *pos,
                             ZPP_Error *error,
-                            uint32_t error_code)
+                            char const *message)
 {
+    error->msg = message;
     error->row = pos->row;
     error->col = pos->col;
-    error->error_code = error_code;
+    error->msg_len = ZPP_strlen(message);
+    
     return -1;
 }
 
@@ -469,9 +475,9 @@ static int ZPP_lexer_read_string_rest(ZPP_Lexer *lexer, ZPP_Error *error, char d
         if (ch == '\n' || ch == '\0')
         {
             return ZPP_return_error(&lexer->pos, error,
-                                    delimiter == '"'           ?
-                                    ZPP_ERROR_UNTERMINATED_STR :
-                                    ZPP_ERROR_UNTERMINATED_CHR);
+                                    delimiter == '"' ?
+                                    "expected \"" :
+                                    "expected '");
         }
         
         ++lexer->pos.ptr;
@@ -1710,9 +1716,7 @@ push_token:;
                 ZPP_fix_ident_token(&src.ptr[j]);
                 src.ptr[j].flags &= ~(uint32_t)ZPP_TOKEN_NO_EXPAND;
             }
-        }
-
-        
+        }        
     }
 
     *had_macro = true;
@@ -1998,12 +2002,17 @@ static bool ZPP_is_defined(ZPP_State *state, ZPP_Token *macro_tok)
 static int ZPP_handle_if_pp(ZPP_State *state,
                             ZPP_Error *error,
                             ZPP_PPNum *result,
-                            ZPP_IfData if_data)
+                            int32_t min_prec,
+                            uint32_t pr_level)
 {
-    enum
-    {
+    enum {
         PLEVEL_MIN,
         PLEVEL_SEL,
+        PLEVEL_LOR,
+        PLEVEL_LAND,
+        PLEVEL_BOR,
+        PLEVEL_BXOR,
+        PLEVEL_BAND,
         PLEVEL_CMP,
         PLEVEL_SHF,   
         PLEVEL_SUM,
@@ -2112,8 +2121,7 @@ static int ZPP_handle_if_pp(ZPP_State *state,
                 {
                     uint32_t old_gr_type = state->pp_if_gr_type;
                     state->pp_if_gr_type = ')';
-                    if ((ec = ZPP_handle_if_pp(state, error, &x,
-                                               (ZPP_IfData){0, 1})) < 0)
+                    if ((ec = ZPP_handle_if_pp(state, error, &x, 0, 1)) < 0)
                     {
                         return ec;
                     }
@@ -2133,11 +2141,9 @@ static int ZPP_handle_if_pp(ZPP_State *state,
                 }   
             }
             
-            if ((ec = ZPP_handle_if_pp(state, error, &x,
-                                       (ZPP_IfData){
-                                           PLEVEL_MAX,
-                                           !!if_data.pr_level*2,
-                                       })) < 0)
+            if ((ec = ZPP_handle_if_pp(state, error,
+                                       &x, PLEVEL_MAX,
+                                       !!pr_level*2)) < 0)
             {
                 return ec;
             }
@@ -2150,7 +2156,7 @@ static int ZPP_handle_if_pp(ZPP_State *state,
     }
 
 parsed_fac:;
-    if (if_data.min_prec == PLEVEL_MAX)
+    if (min_prec == PLEVEL_MAX)
     {
         *result = x;
         return 1;
@@ -2165,7 +2171,7 @@ parsed_fac:;
         }
         else if (ec == 0)
         {
-            if (if_data.pr_level > 0)
+            if (pr_level > 0)
             {
                 return ZPP_return_error(&old_tok.pos, error,
                                         ZPP_ERROR_UNEXPECTED_EOL);
@@ -2179,10 +2185,10 @@ parsed_fac:;
         ZPP_Token op_tok = state->result;
         if (op_tok.type == state->pp_if_gr_type)
         {
-            if (if_data.pr_level > 0)
+            if (pr_level > 0)
             {
                 *result = x;
-                if (if_data.pr_level == 2)
+                if (pr_level == 2)
                 {
                     state->peek_tok = op_tok;
                 }
@@ -2197,6 +2203,7 @@ parsed_fac:;
         }
 
         int min_op_prec = -1;
+        bool old_noeval = state->pp_if_noeval;
         for (int i = 0; i < 2; ++i)
         {
             switch (op_tok.type)
@@ -2239,12 +2246,105 @@ parsed_fac:;
                 }
                 
                 case '*': if (i != 0) { SIGN_OP(*=); }
-                case '/': if (i != 0) { SIGN_OP(/=); }
-                case '%': if (i != 0) { SIGN_OP(%=); }
+                case '/':
                 {
+                    if (i != 0)
+                    {
+                        if (y.val == 0)
+                        {
+                            y.val = 1;
+                            if (!state->pp_if_noeval)
+                            {
+                                return
+                                    ZPP_return_error(&op_tok.pos, error,
+                                                     "division by zero");
+                            }
+                        }
+                        
+                        SIGN_OP(/=);
+                    }
+                }
+                case '%':
+                {
+                    if (i != 0)
+                    {
+                        if (y.val == 0)
+                        {
+                            y.val = 1;
+                            if (!state->pp_if_noeval)
+                            {
+                                return
+                                    ZPP_return_error(&op_tok.pos, error,
+                                                     "division by zero");
+                            }
+                        }
+                        
+                        SIGN_OP(%=);
+                    }
+                    
                     min_op_prec = PLEVEL_MUL;
                     break;
                 }
+
+                case '|':
+                {
+                    if (i != 0)
+                    {
+                        SIGN_OP(|=);
+                    }
+                    
+                    min_op_prec = PLEVEL_BOR;
+                    break;
+                }
+
+                case '^':
+                {
+                    if (i != 0)
+                    {
+                        SIGN_OP(^=);
+                    }
+                    
+                    min_op_prec = PLEVEL_BXOR;
+                    break;
+                }
+
+                case '&':
+                {
+                    if (i != 0)
+                    {
+                        SIGN_OP(&=);
+                    }
+                    
+                    min_op_prec = PLEVEL_BAND;
+                    break;
+                }
+
+                case ZPP_TYPE_OR2:
+                {
+                    if (i != 0)
+                    {
+                        x.val = x.val != 0 || y.val != 0;
+                        continue;
+                    }
+
+                    state->pp_if_noeval |= x.val != 0;
+                    min_op_prec = PLEVEL_LOR;
+                    break;
+                }
+                
+                case ZPP_TYPE_AND2:
+                {
+                    if (i != 0)
+                    {
+                        x.val = x.val != 0 && y.val != 0;
+                        continue;
+                    }
+
+                    state->pp_if_noeval |= x.val == 0;
+                    min_op_prec = PLEVEL_LAND;
+                    break;
+                }
+                
 #undef SIGN_OP
                 
 #define SIGN_CMP(c)                                                     \
@@ -2279,34 +2379,38 @@ parsed_fac:;
 
                 case '?':
                 {
-                    if (if_data.min_prec > PLEVEL_SEL)
+                    if (min_prec > PLEVEL_SEL)
                     {
                         state->peek_tok = op_tok;
                         *result = x;
                         return 1;
                     }
             
-                    // TODO: handle things with side effects i.e. x/0, x%0, etc.
+
+                    old_noeval = state->pp_if_noeval;
+                    if (x.val == 0) state->pp_if_noeval |= 1;
+                    
                     ZPP_PPNum b;
                     uint32_t old_gr_type = state->pp_if_gr_type;
                     state->pp_if_gr_type = ':';
-                    if ((ec = ZPP_handle_if_pp(state, error, &b,
-                                               (ZPP_IfData){0, 1})) < 0)
+                    if ((ec = ZPP_handle_if_pp(state, error, &b, 0, 1)) < 0)
                     {
                         return ec;
                     }
                     state->pp_if_gr_type = old_gr_type;
 
+                    state->pp_if_noeval = old_noeval;
+                    if (x.val != 0) state->pp_if_noeval |= 1;
+                    
                     ZPP_PPNum c;
-                    if ((ec = ZPP_handle_if_pp(state, error, &c,
-                                               (ZPP_IfData){
-                                                   PLEVEL_SEL,
-                                                   !!if_data.pr_level*2,
-                                               })) < 0)
+                    if ((ec = ZPP_handle_if_pp(state, error,
+                                               &c, PLEVEL_SEL,
+                                               !!pr_level*2)) < 0)
                     {
                         return ec;
                     }
-
+                    state->pp_if_noeval = old_noeval;
+                    
                     x = x.val != 0 ? b : c;
                     goto op_break;
                 }
@@ -2318,7 +2422,7 @@ parsed_fac:;
                 }
             }
             
-            if (if_data.min_prec > min_op_prec)
+            if (min_prec > min_op_prec)
             {
                 state->peek_tok = op_tok;
                 *result = x;
@@ -2326,15 +2430,14 @@ parsed_fac:;
             }
             
             if ((ec = ZPP_handle_if_pp(state, error, &y,
-                                       (ZPP_IfData){
-                                           min_op_prec + 1,
-                                           !!if_data.pr_level*2,
-                                       })) < 0)
+                                       min_op_prec + 1,
+                                       !!pr_level*2)) < 0)
             {
                 return ec;
             }
         }
-op_break:;
+op_break:
+        state->pp_if_noeval = old_noeval;    
     }
 }
 
@@ -2632,6 +2735,7 @@ read_token:;
     }
     else if (ZPP_string_cmp3(&lexer->result, "ifdef"))
     {
+        lexer->is_else_off = false;
         ZPP_DIRECTIVE_TRY_READ(lexer, error);
         
         if ((lexer->result.flags & ZPP_TOKEN_IDENT) == 0)
@@ -2639,13 +2743,14 @@ read_token:;
             return ZPP_return_error(&lexer->result.pos, error,
                                     ZPP_ERROR_UNEXPECTED_TOK);
         }
-
+        
         ZPP_lexer_bpush(lexer, ZPP_is_defined(state, &lexer->result));
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
     else if (ZPP_string_cmp3(&lexer->result, "ifndef"))
     {
+        lexer->is_else_off = false;
         ZPP_DIRECTIVE_TRY_READ(lexer, error);
         
         if ((lexer->result.flags & ZPP_TOKEN_IDENT) == 0)
@@ -2653,31 +2758,34 @@ read_token:;
             return ZPP_return_error(&lexer->result.pos, error,
                                     ZPP_ERROR_UNEXPECTED_TOK);
         }
-
+        
         ZPP_lexer_bpush(lexer, !ZPP_is_defined(state, &lexer->result));
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
     else if (ZPP_string_cmp3(&lexer->result, "if"))
     {
+        lexer->is_else_off = false;
+        
         // make it so that macros can't escape this line
         state->context->base.flags |= ZPP_CONTEXT_LOCK;
 
         ZPP_PPNum value; 
         if ((ec = ZPP_handle_if_pp(state, error,
-                                   &value, (ZPP_IfData){0})) < 0)
+                                   &value, 0, 0)) < 0)
         {
             return ec;
         }
         lexer = &state->context->lexer;
-        
         state->context->base.flags &= ~(uint32_t)ZPP_CONTEXT_LOCK;
+        
         ZPP_lexer_bpush(lexer, value.val != 0);
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
     else if (blevel == -1)
     {
+        // TODO: produce errors for #endif, #else, etc. here 
         *lexer = old_lex;
         return 1;
     }
@@ -2685,12 +2793,7 @@ read_token:;
 pp_level0:;
     if (ZPP_string_cmp3(&lexer->result, "endif"))
     {
-        ZPP_lexer_bpop(lexer);
-        if (ZPP_lexer_btop(state->context) == 0)
-        {
-            lexer->is_else_off = 0;
-        }
-        
+        ZPP_lexer_bpop(lexer);      
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
@@ -2714,22 +2817,28 @@ pp_level0:;
             return ZPP_return_error(&lexer->result.pos, error,
                                     ZPP_ERROR_UNEXPECTED_TOK);
         }
-                    
+
+        ZPP_lexer_bpop(lexer);
+        if (ZPP_lexer_btop(state->context) == 0)
+        {
+            ZPP_lexer_bpush(lexer, false);
+            lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
+            goto read_token;
+        }
+        
         lexer->is_else_off |= blevel > 0;
         if (lexer->is_else_off)
         {
-            ZPP_lexer_bpop(lexer);
-            ZPP_lexer_bpush(lexer, 0);
+            ZPP_lexer_bpush(lexer, false);
         }
         else
         {
             // make it so that macros can't escape this line
             state->context->base.flags |= ZPP_CONTEXT_LOCK;
-            ZPP_lexer_bpop(lexer);
             
             ZPP_PPNum value; 
             if ((ec = ZPP_handle_if_pp(state, error,
-                                       &value, (ZPP_IfData){0})) < 0)
+                                       &value, 0, 0)) < 0)
             {
                 return ec;
             }
@@ -2741,8 +2850,7 @@ pp_level0:;
         
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
-    }
-        
+    }        
     else if (blevel == 0)
     {
         if ((ZPP_string_cmp3(&lexer->result, "if") ||
@@ -2760,9 +2868,23 @@ pp_level0:;
    
 #undef ZPP_DIRECTIVE_TRY_READ
 }
-//#undef ZPP_GEN_ARRAY_GROW
-//#undef ZPP_LEXER_TRY_READ
-//#undef ZPP_LEXER_TRY_READ_FULL
+
+#undef ZPP_ALEN
+#undef ZPP_ARRAY
+#undef ZPP_ARRAY_MEM
+#undef ZPP_ARRAY_NEW1
+#undef ZPP_ARRAY_NEW2
+#undef ZPP_ARRAY_NEW3
+#undef ZPP_ARRAY_FREE
+#undef ZPP_ARRAY_GROW
+#undef ZPP_LEXER_TRY_READ
+#undef ZPP_DIRECTIVE_IF_READ
+#undef ZPP_ERROR_INVALID_MACRO
+#undef ZPP_ERROR_INVALID_PASTE
+#undef ZPP_LEXER_TRY_READ_FULL
+#undef ZPP_ERROR_UNEXPECTED_TOK
+#undef ZPP_ERROR_UNEXPECTED_EOL
+#undef ZPP_ERROR_UNEXPECTED_EOF
 
 #endif // ZPP_DEFINE
 #endif // ZPP_ZPP_H
