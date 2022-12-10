@@ -157,3 +157,19 @@
 2
 #endif
 #endif
+
+#if 1*3*3*(2-1u) > -1 ? 1 : 0
+89
+#endif
+
+#if 1 > -1 ? 1 : 0
+88
+#endif
+
+#if 1U+1UL+1ULL+1Ull+1Ul+1u+1ul+1ull+1uLL+1uL+1l+1ll+1L+1LL
+56
+#endif
+
+#if 0128 == 88
+67
+#endif
