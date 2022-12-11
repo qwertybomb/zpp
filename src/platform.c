@@ -18,6 +18,21 @@ int64_t get_clock(void)
     QueryPerformanceCounter(&counter);
     return counter.QuadPart;
 }
+
+void canonicalize_path(char *path)
+{
+    for (; *path != '\0'; ++path)
+    {
+        if (*path >= 'A' && *path <= 'Z')
+        {
+            *path += 'a' - 'A';
+        }
+        else if (*path == '/')
+        {
+            *path = '\\';
+        }
+    }
+}
 #else
 #include <time.h>
 
@@ -30,5 +45,10 @@ void start_clock(void)
 int64_t get_clock(void)
 {
     return clock();
+}
+
+void canonicalize_path(char const *str)
+{
+    (void)str;
 }
 #endif

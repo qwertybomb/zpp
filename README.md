@@ -2,10 +2,8 @@
 A work in progress C preprocessor written in standard C99 with no external libraries required.
 
 ## Main features missing.
-* `#include`.
-* full `#if` support.
+* char literals in `#if`.
 * `#pragma once`
-* `#pragma (push/pop)_macro`
 
 ## Building.
 To build it you must first run `vcvarsall.bat` and then run `nmake`.

@@ -43,18 +43,19 @@
 
 enum
 {
-    ZPP_TOKEN_BOL   = 1 << 1, // token is at the Beginning Of Line
-    ZPP_TOKEN_SPACE = 1 << 2, // a space is before this token 
-    ZPP_TOKEN_IDENT = 1 << 3, // token is an identifier
-    ZPP_TOKEN_PUNCT = 1 << 4, // 6.4.6 Punctuator
-    ZPP_TOKEN_PPNUM = 1 << 5, // token is a pp-number
-    ZPP_TOKEN_STR   = 1 << 6, // token is a "string" L"literal"
-    ZPP_TOKEN_CHAR  = 1 << 7, // token is a {L'c', 'h', 'a', 'r', ' ', l', 't', 'e', 'r', 'a', L'l'}
-    ZPP_TOKEN_ALLOC = 1 << 8, // this token is dynamically allocated
-    ZPP_TOKEN_READY = 1 << 9,
+    ZPP_TOKEN_BOL       = 1 << 1, // token is at the Beginning Of Line
+    ZPP_TOKEN_SPACE     = 1 << 2, // a space is before this token 
+    ZPP_TOKEN_IDENT     = 1 << 3, // token is an identifier
+    ZPP_TOKEN_PUNCT     = 1 << 4, // 6.4.6 Punctuator
+    ZPP_TOKEN_PPNUM     = 1 << 5, // token is a pp-number
+    ZPP_TOKEN_STR       = 1 << 6, // token is a "string" L"literal"
+    ZPP_TOKEN_CHAR      = 1 << 7, // token is a 'c'har literal
+    ZPP_TOKEN_ALLOC     = 1 << 8, // this token is dynamically allocated
+    ZPP_TOKEN_READY     = 1 << 9,
     ZPP_TOKEN_MACRO_ARG = 1 << 10,
     ZPP_TOKEN_NO_EXPAND = 1 << 11,
     ZPP_TOKEN_IDENT_PTR = 1 << 12,
+    ZPP_TOKEN_INC       = 1 << 13,
 };
 
 enum
@@ -69,6 +70,7 @@ enum
 {
     ZPP_LEXER_PP = 1 << 0,
     ZPP_LEXER_BOL = 1 << 1,
+    ZPP_LEXER_INC = 1 << 2,
 };
 
 // NOTE: the first 127 values are just the normal ascii values
@@ -106,20 +108,22 @@ enum
 #define ZPP_ERROR_UNEXPECTED_TOK "unexpected token"
 #define ZPP_ERROR_UNEXPECTED_EOF "unexpected ending"
 
-typedef struct ZPP_Allocator ZPP_Allocator;
-struct ZPP_Allocator
+typedef struct 
 {
     void (*gen_free)(void*, void*);
     void *(*gen_alloc)(void*, size_t);
     void *(*gen_calloc)(void*, size_t);
+    char *(*open_file)(void*, char const*);
+    void (*canonicalize_path)(void*, char*);
     void *(*gen_realloc)(void*, void*, size_t);
-};
+} ZPP_Platform;
 
 typedef struct
 {
     char *ptr;
     uint32_t row;
     uint32_t col;
+    char const *file;
 } ZPP_Pos;
 
 typedef struct
@@ -152,10 +156,18 @@ typedef struct
 
 typedef struct
 {
+    char *ptr;
+    size_t len;
+} ZPP_String;
+
+typedef struct
+{
     ZPP_Context base;
     
     ZPP_Pos pos;
     ZPP_Token result;
+    ZPP_String cur_dir;
+    char const *cur_file;
     
     uint32_t bstack[8];
     uint32_t flags : 3;
@@ -163,18 +175,13 @@ typedef struct
     uint32_t is_else_off;
 } ZPP_Lexer;
 
-typedef struct
-{
-    char *ptr;
-    size_t len;
-} ZPP_String;
-
 typedef struct 
 {
     uint32_t row;
     uint32_t col;
     size_t msg_len;
     char const *msg;
+    char const *file;
 } ZPP_Error;
 
 typedef struct
@@ -243,7 +250,6 @@ typedef struct
 {
     int32_t min_prec;
     uint32_t pr_level;
-    
 } ZPP_IfData;
 
 typedef struct
@@ -267,17 +273,27 @@ typedef struct
     ZPP_IdentMap ident_map;
     ZPP_GenMap macro_stack;
 
-    ZPP_Allocator *allocator;
+    ZPP_Platform *platform;
     ZPP_ContextBlock *context;
     ZPP_ARRAY(char) context_mem;
-    
+
+    ZPP_String cur_dir;
+    char const *cur_file;
+    ZPP_ARRAY(ZPP_String) include_paths;
+
     uint32_t pp_if_gr_type : 8;
-    bool pp_if_noeval : 1;
     bool has_init : 1;
+    bool pp_if_noeval : 1;
+    bool no_file_error : 1;
 }  ZPP_State;
 
-ZPP_LINKAGE int ZPP_init_state(ZPP_State *state, char *file_data);
+ZPP_LINKAGE int ZPP_init_state(ZPP_State *state,
+                               char *file_data,
+                               char const *file_name);
+
 ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error);
+
+ZPP_LINKAGE void ZPP_include_path_add(ZPP_State *state, ZPP_String path);
 
 /*
   NOTE: regarding functions defined explicitly with `static`.
@@ -304,7 +320,7 @@ ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error);
         }                                                           \
     } while (false)
 
-#define ZPP_DIRECTIVE_IF_READ(s_, e_)                                \
+#define ZPP_STATE_TRY_READ_FULL(s_, e_)                              \
     do                                                               \
     {                                                                \
         ec = ZPP_read_token(s_, e_);                                 \
@@ -365,6 +381,7 @@ static int ZPP_return_error(ZPP_Pos *pos,
     error->msg = message;
     error->row = pos->row;
     error->col = pos->col;
+    error->file = pos->file;
     error->msg_len = ZPP_strlen(message);
     
     return -1;
@@ -766,7 +783,16 @@ star_case:
                 ++lexer->pos.col;
                 ++lexer->pos.ptr;
                 lexer->result.flags |= ZPP_TOKEN_PUNCT;
-            
+
+                // NOTE: we don't care about line splices for numbers right now
+                if (ZPP_is_digit(*lexer->pos.ptr) ||
+                    (*lexer->pos.ptr == '.' &&
+                     ZPP_is_digit(*lexer->pos.ptr + 1)))
+                {
+                    ++lexer->result.len;
+                    goto lex_number;
+                }
+
                 ZPP_Pos old_pos = lexer->pos;
                 if (ZPP_lexer_read_char(lexer) == '.' &&
                     ZPP_lexer_read_char(lexer) == '.')
@@ -782,8 +808,40 @@ star_case:
                 return 1;
             }
             
-            case '>':
             case '<':
+            {
+                if ((lexer->flags & ZPP_LEXER_INC) != 0)
+                {
+                    ++lexer->pos.col;
+                    ++lexer->pos.ptr;
+                    
+                    lexer->result.len = 1;
+                    lexer->result.flags |= ZPP_TOKEN_INC;
+
+                    for (;;)
+                    {
+                        char c = *lexer->pos.ptr;
+                        if (c == '\0' ||
+                            ((lexer->flags & ZPP_LEXER_PP) != 0 && c == '\n'))
+                        {
+                            return 0;
+                        }
+
+                        ++lexer->pos.col;
+                        ++lexer->pos.ptr;
+                        ++lexer->result.len;
+
+                        if (c == '>')
+                        {
+                            break;
+                        }
+                    }
+
+                    return 1;
+                }
+            }
+            
+            case '>':
             {
                 char start_ch = *lexer->pos.ptr;
                 
@@ -1006,14 +1064,15 @@ star_case:
                 if (ZPP_is_digit(*lexer->pos.ptr))
                 {
                     lexer->result.len = 0;
+lex_number:         
                     lexer->result.flags |= ZPP_TOKEN_PPNUM;
-                
                     do
                     {
                         ++lexer->result.len;
                         ++lexer->pos.ptr;
                         ++lexer->pos.col;
-                    } while (ZPP_is_digit(*lexer->pos.ptr) ||
+                    } while (*lexer->pos.ptr == '.' || 
+                             ZPP_is_digit(*lexer->pos.ptr) ||
                              ZPP_is_ident_char(*lexer->pos.ptr) ||
                              ((*lexer->pos.ptr == '+' || *lexer->pos.ptr == '-') &&
                               (*lexer->pos.ptr == 'E' || *lexer->pos.ptr == 'e' ||
@@ -1034,22 +1093,32 @@ star_case:
 
 static void *ZPP_gen_alloc(ZPP_State *state, size_t size)
 {
-    return state->allocator->gen_alloc(state->allocator, size); 
+    return state->platform->gen_alloc(state->platform, size); 
 }
 
 static void *ZPP_gen_calloc(ZPP_State *state, size_t size)
 {
-    return state->allocator->gen_calloc(state->allocator, size); 
+    return state->platform->gen_calloc(state->platform, size); 
 }
 
 static void *ZPP_gen_realloc(ZPP_State *state, void *ptr, size_t size)
 {
-    return state->allocator->gen_realloc(state->allocator, ptr, size); 
+    return state->platform->gen_realloc(state->platform, ptr, size); 
 }
 
 static void ZPP_gen_free(ZPP_State *state, void *ptr)
 {
-    state->allocator->gen_free(state->allocator, ptr); 
+    state->platform->gen_free(state->platform, ptr); 
+}
+
+static void ZPP_canonicalize_path(ZPP_State *state, char *str)
+{
+    state->platform->canonicalize_path(state->platform, str);
+}
+
+static char *ZPP_open_file(ZPP_State *state, char const *str)
+{
+    return state->platform->open_file(state, str);
 }
 
 static int ZPP_context_pop(ZPP_State *state)
@@ -1143,16 +1212,32 @@ static int ZPP_context_lex_direct(ZPP_State *state, ZPP_Error *error)
         {
             case ZPP_CONTEXT_FILE:
             {
-                ZPP_Lexer *lexer = (ZPP_Lexer*)state->context;
+                ZPP_Lexer *lexer = &state->context->lexer;
             
                 int result = ZPP_lexer_lex_direct(lexer, error);
                 state->result = lexer->result;
-
+                state->result.pos.file = state->cur_file;
+                    
                 if (result == 0)
                 {
+                    if (lexer->bstack_len != 0 &&
+                        (lexer->flags & ZPP_LEXER_PP) == 0)
+                    {
+                        return
+                            ZPP_return_error(&lexer->pos, error,
+                                             "missing #endif");
+                    }
+
+                    char const *last_file = lexer->pos.file;
                     if (ZPP_context_pop(state) != 0)
                     {
-                         continue;
+                        // NOTE: we don't want to free the base file name
+                        ZPP_gen_free(state, (void*)last_file);
+
+                        lexer = &state->context->lexer;
+                        state->cur_dir = lexer->cur_dir;
+                        state->cur_file = lexer->pos.file;
+                        continue;
                     }
                     
                     return 0;
@@ -1164,7 +1249,7 @@ static int ZPP_context_lex_direct(ZPP_State *state, ZPP_Error *error)
             case ZPP_CONTEXT_MACRO:
             {
                 ZPP_MacroContext *macro_context =
-                    (ZPP_MacroContext*)state->context;
+                    &state->context->macro_context;
 
                 if (macro_context->token_len == 0)
                 {
@@ -1190,7 +1275,7 @@ static int ZPP_context_lex_direct(ZPP_State *state, ZPP_Error *error)
                 return 1;
             }
             
-            default: __debugbreak(); return -1;
+            default: return -1;
         }
     }
 }
@@ -1299,6 +1384,7 @@ static ZPP_Ident *ZPP_ident_map_set(ZPP_State *state, ZPP_Ident *macro)
         state->ident_map.keys = new_keys;
     }
 
+    ++state->ident_map.len;
     macro->is_alive = true;
     macro->hash = ZPP_string_hash(macro->name, macro->name_len);
     uint32_t map_index = macro->hash & (state->ident_map.cap - 1);
@@ -1388,6 +1474,7 @@ static void ZPP_gen_map_set(ZPP_State *state,
         map->keys = new_keys;
     }
 
+    ++map->len;
     key->hash = ZPP_string_hash(key->name, key->name_len);
     uint32_t map_index = key->hash & (map->cap - 1);
 
@@ -1404,7 +1491,27 @@ static void ZPP_gen_map_set(ZPP_State *state,
     }
 }
 
-ZPP_LINKAGE int ZPP_init_state(ZPP_State *state, char *file_data)
+static ZPP_String ZPP_parse_path_dir(char const *path)
+{
+    ZPP_String result = {
+        .ptr = (char*)path,
+        .len = ZPP_strlen(path),
+    };
+
+    for (size_t i = result.len; i-- != 0; --result.len)
+    {
+        if (path[i] == '\\' || path[i] == '/')
+        {
+            break;
+        }
+    }
+
+    return result;
+}
+ 
+ZPP_LINKAGE int ZPP_init_state(ZPP_State *state,
+                               char *file_data,
+                               char const *file_name)
 {
     if (!state->has_init)
     {
@@ -1422,29 +1529,35 @@ ZPP_LINKAGE int ZPP_init_state(ZPP_State *state, char *file_data)
         
         state->line_buf = ZPP_ARRAY_NEW1();
         state->context_mem = ZPP_ARRAY_NEW1();
+        state->include_paths = ZPP_ARRAY_NEW1();
         state->has_init = true;
     }
 
     if (file_data != NULL)
     {
+        state->cur_file = file_name;
+        state->cur_dir = ZPP_parse_path_dir(file_name);
+        
         ZPP_context_push(state,
                          &(ZPP_ContextBlock)
                          {
                              .lexer = {
                                  .pos.ptr = file_data,
+                                 .pos.file = file_name,
                                  .flags = ZPP_LEXER_BOL,
+                                 .cur_dir = state->cur_dir,
                                  .base.flags = ZPP_CONTEXT_FILE,
                                  .base.cur_len = sizeof(ZPP_Lexer),
                              }
                          });
+
     }
     
     return 1;
 }
 
 static int ZPP_paste_tokens(ZPP_State *state, ZPP_Error *error,
-                            ZPP_Token *result, ZPP_Token *rhs,
-                            ZPP_Pos *paste_pos)
+                            ZPP_Token *result, ZPP_Token *rhs)
 {
     // NOTE: most c preprocessors seem to do it this way
     char *concat_token_spell =
@@ -1475,11 +1588,12 @@ static int ZPP_paste_tokens(ZPP_State *state, ZPP_Error *error,
     {
         // we either had a comment /##/ meaning EOF or
         // the paste is not valid as a single token
-        return ZPP_return_error(paste_pos, error,
+        return ZPP_return_error(&rhs->pos, error,
                                 ZPP_ERROR_INVALID_PASTE);
     }
 
     *result = lexer.result;
+    result->pos.file = rhs->pos.file;
     if (result->pos.ptr == concat_token_spell)
     {
         // add to array of allocated tokens
@@ -1627,6 +1741,48 @@ static int ZPP_expand_macro_arg(ZPP_State *state,
     return 1;
 }
 
+static ZPP_Token ZPP_num_to_tok(ZPP_State *state, uint32_t number)
+{
+    char *result = ZPP_gen_alloc(state, 10);
+
+    char *ptr = result;
+    uint32_t scale = number;
+    do
+    {
+        ++ptr;
+        scale /= 10;
+    } while(scale != 0);
+
+    uint32_t len = (uint32_t)(ptr - result);
+    do
+    {
+        *--ptr = number % 10 + '0';
+        number /= 10;
+    } while (ptr != result);
+
+    ZPP_ARRAY_GROW(&state->line_buf, 1);
+    state->line_buf[ZPP_ALEN(state->line_buf) - 1] = result;
+
+    return (ZPP_Token) {
+        .len = len,
+        .pos.ptr = result,
+        .flags = ZPP_TOKEN_PPNUM,
+    };
+}
+
+static int ZPP_builtin_macro(ZPP_State *state,
+                             ZPP_Token *macro,
+                             ZPP_Token token)
+{
+    token.pos.row = macro->pos.row;
+    token.pos.col = macro->pos.col;
+    token.pos.file = macro->pos.file;
+    token.flags |= macro->flags & ZPP_TOKEN_SPACE;
+    state->result = token;
+    
+    return 1;
+}
+
 // TODO: handles cases such as:
 // #define a +
 // #define b =
@@ -1658,7 +1814,18 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
     }
     
     ZPP_Token ident_tok = state->result;
-    if (ident == NULL || !ident->is_macro) 
+    if (ident == NULL) 
+    {
+        if (ZPP_string_cmp3(&ident_tok, "__LINE__"))
+        {
+            return
+                ZPP_builtin_macro(state, &ident_tok,
+                                  ZPP_num_to_tok(state, ident_tok.pos.row));
+        }
+        
+        return 1;
+    }
+    else if (!ident->is_macro)
     {
         return 1;
     }
@@ -1971,8 +2138,7 @@ was_stringize:;
                         else if ((ec =
                                   ZPP_paste_tokens(state, error,
                                                    &tokens[tok_arr.len - 1],
-                                                   &arg.ptr[0],
-                                                   &ident->tokens[i - 1].pos)) < 0)
+                                                   &arg.ptr[0])) < 0)
                         {
                             return ec;
                         }
@@ -2013,8 +2179,7 @@ was_stringize:;
                     {
                         if (((ec = ZPP_paste_tokens(state, error,
                                                     &tokens[tok_arr.len - 1],
-                                                    &pasted_tok,
-                                                    &ident->tokens[i - 1].pos)) < 0))
+                                                    &pasted_tok)) < 0))
                         {
                             return ec;
                         }
@@ -2052,6 +2217,7 @@ was_stringize:;
         {
             tokens[i].pos.row = ident_tok.pos.row;
             tokens[i].pos.col = ident_tok.pos.col;
+            tokens[i].pos.file = ident_tok.pos.file;
         }
         
         // disable the macro before expanding it
@@ -2115,7 +2281,7 @@ static int ZPP_handle_if_pp(ZPP_State *state,
     
     int ec;
     ZPP_PPNum x = {-9876, 0};  
-    ZPP_DIRECTIVE_IF_READ(state, error);
+    ZPP_STATE_TRY_READ_FULL(state, error);
     if ((state->result.flags & ZPP_TOKEN_IDENT) != 0)
     {
         if (ZPP_string_cmp3(&state->result, "defined"))
@@ -2739,6 +2905,94 @@ static int ZPP_handle_pragma(ZPP_State *state,
     return 1;
 }
 
+static bool ZPP_try_open_file(ZPP_State *state,
+                              ZPP_String file_name,
+                              ZPP_String dir)
+{
+    bool has_trail =
+        dir.len > 0 && 
+        (dir.ptr[dir.len - 1] == '/' ||
+         dir.ptr[dir.len - 1] == '\\');
+            
+    size_t full_path_len =
+        dir.len + file_name.len + !has_trail;
+    
+    char *full_path =
+        ZPP_gen_alloc(state, full_path_len + 1);
+    full_path[full_path_len] = '\0';
+
+    char *write_ptr = full_path;
+    ZPP_memcpy(write_ptr, dir.ptr, dir.len);
+    write_ptr += dir.len;
+
+    if (dir.len > 0 && !has_trail) *write_ptr++ = '/';
+    ZPP_memcpy(write_ptr, file_name.ptr, file_name.len);
+    write_ptr += file_name.len;
+    
+    ZPP_canonicalize_path(state, full_path);
+    char *file_data = ZPP_open_file(state, full_path);
+    if (file_data == NULL)
+    {
+        ZPP_gen_free(state, full_path);
+        return false;
+    }
+
+    state->cur_file = full_path;
+    state->cur_dir = ZPP_parse_path_dir(full_path);
+    ZPP_context_push(state,
+                     &(ZPP_ContextBlock)
+                     {
+                         .lexer = {
+                             .pos.ptr = file_data,
+                             .cur_file = full_path,
+                             .flags = ZPP_LEXER_BOL,
+                             .cur_dir = state->cur_dir,
+                             .base.flags = ZPP_CONTEXT_FILE,
+                             .base.cur_len = sizeof(ZPP_Lexer),
+                         }
+                     });
+
+    return true;
+}
+
+static int ZPP_handle_include(ZPP_State *state,
+                              ZPP_Error *error,
+                              bool use_cur_dir,
+                              ZPP_String file_name)
+{
+    if (use_cur_dir)
+    {
+        if(ZPP_try_open_file(state, file_name, state->cur_dir))
+        {
+            return 1;
+        }
+    }
+    
+    for (uint32_t i = 0; i < ZPP_ALEN(state->include_paths); ++i)
+    {
+        ZPP_String dir = state->include_paths[i];
+        if (ZPP_try_open_file(state, file_name, dir))
+        {
+            return 1;
+        }
+    }
+
+    if (state->no_file_error)
+    {
+        return
+            ZPP_return_error(&state->result.pos, error,
+                             "couldn't file not found");
+    }
+    
+    return 1;
+}
+
+ZPP_LINKAGE void ZPP_include_path_add(ZPP_State *state, ZPP_String path)
+{
+    ZPP_ARRAY_GROW(&state->include_paths, 1);
+    state->include_paths[ZPP_ALEN(state->include_paths) - 1] = path;
+}
+
 ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error)
 {
 read_token:;
@@ -3018,6 +3272,53 @@ read_token:;
         lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
         goto read_token;
     }
+    else if (ZPP_string_cmp3(&lexer->result, "include"))
+    {
+        lexer->flags |= ZPP_LEXER_INC;
+
+        // TODO: better support macro headers
+        ZPP_STATE_TRY_READ_FULL(state, error);
+
+        lexer = &state->context->lexer;
+        lexer->flags &= ~(uint32_t)ZPP_LEXER_INC;
+        lexer->flags &= ~(uint32_t)ZPP_LEXER_PP;
+        if ((state->result.flags & ZPP_TOKEN_STR) != 0)
+        {
+            if (state->result.pos.ptr[0] == 'L')
+            {
+                return ZPP_return_error(&state->result.pos, error,
+                                        "expected a non wide string");
+            }
+
+            if ((ec = ZPP_handle_include(state, error, true,
+                                         (ZPP_String) {
+                                             .len = state->result.len - 2,
+                                             .ptr = state->result.pos.ptr + 1,
+                                         })) < 0)
+            {
+                return ec;
+            }           
+        }
+        else if ((state->result.flags & ZPP_TOKEN_INC) != 0)
+        {
+            if ((ec = ZPP_handle_include(state, error, false,
+                                         (ZPP_String) {
+                                             .len = state->result.len - 2,
+                                             .ptr = state->result.pos.ptr + 1,
+                                         })) < 0)
+            {
+                return ec;
+            }               
+        }
+        else
+        {
+            return
+                ZPP_return_error(&state->result.pos, error,
+                                 ZPP_ERROR_UNEXPECTED_TOK);
+        }
+        
+        goto read_token;
+    }
     else if (ZPP_string_cmp3(&lexer->result, "ifdef"))
     {
         lexer->is_else_off = false;
@@ -3177,7 +3478,7 @@ pp_level0:;
 #undef ZPP_ARRAY_FREE
 #undef ZPP_ARRAY_GROW
 #undef ZPP_LEXER_TRY_READ
-#undef ZPP_DIRECTIVE_IF_READ
+#undef ZPP_DIRECTIVE_READ
 #undef ZPP_ERROR_INVALID_MACRO
 #undef ZPP_ERROR_INVALID_PASTE
 #undef ZPP_LEXER_TRY_READ_FULL

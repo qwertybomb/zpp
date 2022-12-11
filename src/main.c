@@ -8,10 +8,10 @@
 #define ZPP_LINKAGE static
 #include "zpp.h"
 
-#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 // NOTE: only for testing
 static char *read_whole_file(char const *path)
@@ -36,10 +36,10 @@ static char *read_whole_file(char const *path)
 }
 
 // TODO: maybe put this into the zpp library
-static void ZPP_print_error(char const *file_path, ZPP_Error *error)
+static void ZPP_print_error(ZPP_Error *error)
 {
     printf("%s:%u:%u: error: %.*s\n",
-           file_path, error->row + 1, error->col +1,
+           error->file, error->row + 1, error->col +1,
            (int)error->msg_len, error->msg);
 }
 
@@ -67,6 +67,19 @@ static void alloc_gen_free(void *ctx, void *ptr)
     free(ptr);
 }
 
+static void canonicalize_path_impl(void *ctx, char *path)
+{
+    (void)ctx;
+    canonicalize_path(path);
+}
+
+static char *open_file_impl(void *ctx, char const *path)
+{
+    (void)ctx;
+    return read_whole_file(path);
+}
+
+// TODO: put into zpp.h
 static int ZPP_define_macro(ZPP_State *state,
                             ZPP_Error *error, 
                             char *name, char *val)
@@ -132,16 +145,21 @@ int main(int argc, char **argv)
     start_clock();
     int64_t start_time = get_clock();
     ZPP_State state = {
-        .allocator = &(ZPP_Allocator)
+        .platform = &(ZPP_Platform)
         {
+            .open_file   = &open_file_impl,
             .gen_free    = &alloc_gen_free,
             .gen_alloc   = &alloc_gen_alloc,
             .gen_calloc  = &alloc_gen_calloc,
             .gen_realloc = &alloc_gen_realloc,
+            .canonicalize_path = &canonicalize_path_impl,
         },
     };
 
-    if (ZPP_init_state(&state, NULL) < 0) return 1;
+    if (ZPP_init_state(&state, NULL, "") < 0)
+    {
+        return 1;
+    }
 
     char *file_path = NULL;
     bool print_time = false;
@@ -167,10 +185,26 @@ int main(int argc, char **argv)
             if (ZPP_define_macro(&state, &error, 
                                  macro_name, macro_val) < 0)
             {
-                ZPP_print_error("<arg>", &error);
+                error.file = "<arg>";
+                ZPP_print_error(&error);
                 return 1;
             }  
                                 
+        }
+        else if (argv[i][0] == '-' && argv[i][1] == 'I')
+        {
+            char *include_path = argv[i] + 2;
+            if (*include_path == '\0')
+            {
+                if (i + 1 > argc) continue;
+                include_path = argv[++i];
+            }
+
+            ZPP_include_path_add(&state,
+                                 (ZPP_String) {
+                                     .ptr = include_path,
+                                     .len = strlen(include_path),
+                                 });
         }
         else if (strcmp(argv[i], "--dump") == 0)
         {
@@ -190,9 +224,13 @@ int main(int argc, char **argv)
     char *file_data = read_whole_file(file_path);
 
     if (file_data == NULL) return 1;
-    if (ZPP_init_state(&state, file_data) <= 0) return 1;
+    if (ZPP_init_state(&state, file_data, file_path) <= 0)
+    {
+        return 1;
+    }
 
-    size_t last_row = 0;    
+    size_t last_row = 0;
+    char const *last_file = file_path;
     for(;;)
     {
         ec = ZPP_read_token(&state, &error);
@@ -203,12 +241,16 @@ int main(int argc, char **argv)
         else if (ec == -1)
         {
             putchar('\n');
-            ZPP_print_error(file_path, &error);
+            ZPP_print_error(&error);
             return 1;
         }
 
         ZPP_Token token = state.result;
-        if (token.pos.row != last_row)
+        if (token.pos.file != last_file)
+        {
+            printf("\n#line %u %s\n", token.pos.row, token.pos.file);
+        }
+        else if (token.pos.row != last_row)
         {
             size_t line_difference = token.pos.row - last_row;
             if (line_difference < 3)
@@ -219,10 +261,11 @@ int main(int argc, char **argv)
             {
                 printf("\n#line %u\n", token.pos.row + 1);
             }
-
-            last_row = token.pos.row;
         }
 
+        last_row = token.pos.row;
+        last_file = token.pos.file;
+        
         if ((token.flags & ZPP_TOKEN_SPACE) != 0)
         {
             fputc(' ', stdout);
