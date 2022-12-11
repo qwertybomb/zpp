@@ -79,63 +79,6 @@ static char *open_file_impl(void *ctx, char const *path)
     return read_whole_file(path);
 }
 
-// TODO: put into zpp.h
-static int ZPP_define_macro(ZPP_State *state,
-                            ZPP_Error *error, 
-                            char *name, char *val)
-{
-    ZPP_Lexer lexer = {
-        .pos =
-        {
-            .ptr = val,
-        },
-    };
-
-    int ec;
-    if ((ec = ZPP_lexer_lex_direct(&lexer, error)) < 0)
-    {
-        return ec;
-    }
-
-    ZPP_Token *tokens = NULL;
-    if (ec != 0)
-    {
-        tokens = ZPP_gen_alloc(state, sizeof *tokens);
-        tokens[0] = lexer.result;
-    }
-    
-    ZPP_String text_str = {
-        .ptr = name,
-        .len = strlen(name),
-    };
-
-    ZPP_Ident *old_macro =
-        ZPP_ident_map_get(state, text_str);
-    
-    ZPP_Ident new_macro = {
-        .tokens = tokens,
-        .token_len = tokens != NULL,
-        .name = text_str.ptr,
-        .name_len = (uint32_t)text_str.len,
-        .is_macro = true,
-    };
-
-    if (old_macro != NULL)
-    {
-        new_macro.name = old_macro->name;
-        new_macro.hash = old_macro->hash;
-
-        ZPP_gen_free(state, old_macro->tokens);
-        *old_macro = new_macro;
-    }
-    else
-    {
-        ZPP_ident_map_set(state, &new_macro);
-    }
-
-    return 1;
-}
-
 // TODO: make sure to add space when two tokens cannot paste e.g. | | != ||, a | == a|
 int main(int argc, char **argv)
 {
@@ -182,8 +125,8 @@ int main(int argc, char **argv)
                 *macro_val++ = '\0';
             }
             
-            if (ZPP_define_macro(&state, &error, 
-                                 macro_name, macro_val) < 0)
+            if (ZPP_user_define_macro(&state, &error, 
+                                      macro_name, macro_val) < 0)
             {
                 error.file = "<arg>";
                 ZPP_print_error(&error);

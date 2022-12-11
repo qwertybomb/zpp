@@ -295,6 +295,9 @@ ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error);
 
 ZPP_LINKAGE void ZPP_include_path_add(ZPP_State *state, ZPP_String path);
 
+ZPP_LINKAGE int ZPP_user_define_macro(ZPP_State *state,
+                                      ZPP_Error *error,
+                                      char *name, char *val);
 /*
   NOTE: regarding functions defined explicitly with `static`.
   these are for internal use only and do not expect them to be stable.
@@ -1822,7 +1825,28 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
                 ZPP_builtin_macro(state, &ident_tok,
                                   ZPP_num_to_tok(state, ident_tok.pos.row));
         }
-        
+        else if (ZPP_string_cmp3(&ident_tok, "__FILE__"))
+        {
+            size_t cur_file_len = ZPP_strlen(state->cur_file);
+            size_t file_string_len = ZPP_strlen(state->cur_file) + 2;
+            char *file_string = ZPP_gen_alloc(state, file_string_len);
+
+            file_string[0] = '"';
+            ZPP_memcpy(file_string + 1, state->cur_file, cur_file_len);
+            file_string[file_string_len - 1] = '"';
+            
+            ZPP_ARRAY_GROW(state->line_buf, 1);
+            state->line_buf[ZPP_ALEN(state->line_buf) - 1] = file_string;
+
+            return 
+                ZPP_builtin_macro(state, &ident_tok,
+                                  (ZPP_Token) {
+                                      .pos.ptr = file_string,
+                                      .flags = ZPP_TOKEN_STR,
+                                      .len = (uint32_t)file_string_len,
+                                  });
+        }
+
         return 1;
     }
     else if (!ident->is_macro)
@@ -1835,7 +1859,7 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
         return 1;
     }
  
-    ZPP_ARRAY(ZPP_TokenArray) macro_args = NULL;
+    ZPP_ARRAY(ZPP_TokenArray)  macro_args = NULL;
     ZPP_ARRAY(ZPP_TokenArray) expand_macro_args = NULL;
     if (ident->is_fn_macro)
     {
@@ -2991,6 +3015,76 @@ ZPP_LINKAGE void ZPP_include_path_add(ZPP_State *state, ZPP_String path)
 {
     ZPP_ARRAY_GROW(&state->include_paths, 1);
     state->include_paths[ZPP_ALEN(state->include_paths) - 1] = path;
+}
+
+ZPP_LINKAGE int ZPP_user_define_macro(ZPP_State *state,
+                                      ZPP_Error *error,
+                                      char *name, char *val)
+{
+    ZPP_Lexer lexer = {
+        .pos =
+        {
+            .ptr = val,
+            .file = "<macro>",
+        },
+    };
+
+    ZPP_Token *tokens = NULL;
+    ZPP_GenArray tok_arr = {0};
+
+    for(;;)
+    {
+        int ec;
+        if ((ec = ZPP_lexer_lex_direct(&lexer, error)) < 0)
+        {
+            return ec;
+        }
+        else if (ec == 0)
+        {
+            break;
+        }
+
+        if (++tok_arr.len > tok_arr.cap)
+        {
+            tok_arr.cap = tok_arr.len*3/2;
+            tokens =
+                ZPP_gen_realloc(state, tokens,
+                                tok_arr.cap*sizeof *tokens);
+        }
+
+        tokens[tok_arr.len - 1] = lexer.result;
+    }
+
+    ZPP_String text_str = {
+        .ptr = name,
+        .len = ZPP_strlen(name),
+    };
+
+    ZPP_Ident *old_macro =
+        ZPP_ident_map_get(state, text_str);
+    
+    ZPP_Ident new_macro = {
+        .tokens = tokens,
+        .is_macro = true,
+        .name = text_str.ptr,
+        .name_len = (uint32_t)text_str.len,
+        .token_len = (uint32_t)tok_arr.len,
+    };
+
+    if (old_macro != NULL)
+    {
+        new_macro.name = old_macro->name;
+        new_macro.hash = old_macro->hash;
+
+        ZPP_gen_free(state, old_macro->tokens);
+        *old_macro = new_macro;
+    }
+    else
+    {
+        ZPP_ident_map_set(state, &new_macro);
+    }
+
+    return 1;
 }
 
 ZPP_LINKAGE int ZPP_read_token(ZPP_State *state, ZPP_Error *error)

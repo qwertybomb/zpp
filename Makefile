@@ -1,7 +1,7 @@
 SRC=src
 BIN=bin
 LINK=link
-EXE=prog.exe
+EXE=zpp.exe
 LIBS=kernel32.lib
 FLAGS=-nologo -W4 -permissive- -wd4200
 LINK_FLAGS=-incremental:no -out:$(EXE)
