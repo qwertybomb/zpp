@@ -1835,7 +1835,7 @@ static int ZPP_expand_macro(ZPP_State *state, ZPP_Error *error, bool *had_macro)
             ZPP_memcpy(file_string + 1, state->cur_file, cur_file_len);
             file_string[file_string_len - 1] = '"';
             
-            ZPP_ARRAY_GROW(state->line_buf, 1);
+            ZPP_ARRAY_GROW(&state->line_buf, 1);
             state->line_buf[ZPP_ALEN(state->line_buf) - 1] = file_string;
 
             return 
